@@ -105,7 +105,7 @@ function md(x0::Vector{T}, v0::Vector{T}, mass, dt, nsteps, isave, forces!) wher
 end
 
 
-#=
+
 # Running the MD simulation with 100 particles
 trajectory = md((
     x0 = [random_vec(Vec2D{Float64},(-50,50)) for _ in 1:100 ], 
@@ -116,7 +116,7 @@ trajectory = md((
     isave = 10,
     forces! = (f,x) -> forces!(f,x, (i,j,p1,p2) -> fₓ(p1,p2,cutoff))
 )...)
-=#
+
 # Initialize default plot settings
 begin
     using Plots
@@ -127,7 +127,7 @@ begin
         size=(400,400)
     )    
 end
-#=
+
 # Visualizing the trajectory of particles
 anim = @animate for frame in trajectory
     scatter(
@@ -141,9 +141,11 @@ anim = @animate for frame in trajectory
 end
 
 # Save as GIF
-gif_path = joinpath(@__DIR__, "trajectory.gif")
+gif_dir = joinpath(@__DIR__, "gif_martinez_Md")
+isdir(gif_dir) || mkpath(gif_dir)
+gif_path = joinpath(gif_dir, "trajectory.gif")
 gif(anim, gif_path, fps=20)
-=#
+
 # Implementing periodic boundary conditions (as the domain is wrapped in a ring)
 function wrap(x,side)
     x = rem(x,side) #  like mod(x,side) but works for negative x (returns negative values)
@@ -200,45 +202,7 @@ function md_wrap(x0::Vector{T}, v0::Vector{T}, mass, dt, nsteps, isave, forces!,
     return trajectory
 end
 
-#Molecular Dynamics simulator using velocity Verlet algorithm
-function md_Verlet(x0::Vector{T}, v0::Vector{T}, mass, dt, nsteps, isave, forces!) where T
-    #=
-    x0: Initial positions of particles (vector of T)
-    v0: Initial velocities of particles (vector of T)
-    =#
-
-    x = copy(x0)
-    v = copy(v0)
-    a = similar(x0)
-    f = similar(x0) # Initialize force vector
-    trajectory = [ copy(x0) ] # will store the trajectory
-    for step in 1:nsteps
-        # Compute forces and store in f
-        forces!(f,x)
-        # Accelerations (@. means element-wise operation)
-        @. a = f / mass
-        # Update positions
-        @. x = x + v*dt + a*dt^2/2
-        for i in 1:length(x)
-            x[i] = wrap.(x[i],side) # ensure positions are wrapped within the box
-        end
-        # Update velocities only at half-time step
-        @. v = v + 0.5*a*dt
-        # Recompute forces at new positions
-        forces!(f,x)
-        # Update accelerations
-        @. a = f / mass
-        # Complete velocity update
-        @. v = v + 0.5*a*dt
-        # Save the trajectory at specified intervals
-        if mod(step,isave) == 0
-            println("Saved trajectory at step: ",step)
-            push!(trajectory,copy(x))
-        end
-    end
-    return trajectory
-end
-
+# Running the MD simulation with periodic boundary conditions
 const side = 100.0 # Size of the periodic box
 
 
@@ -267,7 +231,7 @@ anim_periodic = @animate for frame in trajectory_periodic
 end
 
 # Save as GIF
-gif_path = joinpath(@__DIR__, "trajectory_periodic.gif")
+gif_path = joinpath(gif_dir, "trajectory_periodic.gif")
 gif(anim_periodic, gif_path, fps=20)
 
 
@@ -277,15 +241,16 @@ struct Vec3D{T} <: FieldVector{3,T}
     y::T
     z::T
 end
-#=
-trajectory_periodic_3D = md((
+
+trajectory_periodic_3D = md_wrap((
     x0 = [random_vec(Vec3D{Float64},-50:50) for _ in 1:100 ], 
     v0 = [random_vec(Vec3D{Float64},-1:1) for _ in 1:100 ], 
     mass = [ 1.0 for _ in 1:100 ],
     dt = 0.1,
     nsteps = 1000,
     isave = 10,
-    forces! = (f,x) -> forces!(f,x,(i,j,p1,p2) -> fₓ(p1,p2,cutoff,side))
+    forces! = (f,x) -> forces!(f,x,(i,j,p1,p2) -> fₓ(p1,p2,cutoff,side)),
+    side = side
 )...)
 
 # Visualizing the 3D trajectory with periodic boundary conditions
@@ -302,9 +267,9 @@ anim_periodic_3D = @animate for frame in trajectory_periodic_3D
 end
 
 # Save as GIF
-gif_path = joinpath(@__DIR__, "trajectory_periodic_3D.gif")
+gif_path = joinpath(gif_dir, "trajectory_periodic_3D.gif")
 gif(anim_periodic_3D, gif_path, fps=20)
-=#
+
 # Error propagation 
 using Measurements
 
@@ -315,15 +280,16 @@ function random_vec(::Type{Vec2D{Measurement{T}}},range,Δ) where T # Measuremen
     )
     return p
 end
-#=
-trajectory_2D_error = md((
+
+trajectory_2D_error = md_wrap((
     x0 = [random_vec(Vec2D{Measurement{Float64}},(-50,50),1e-5) for _ in 1:100 ], 
     v0 = [random_vec(Vec2D{Measurement{Float64}},(-1,1),1e-5) for _ in 1:100 ],
     mass = [ 1.0 for _ in 1:100 ],
     dt = 0.1,
     nsteps = 100,
     isave = 1,
-    forces! = (f,x) -> forces!(f,x, (i,j,p1,p2) -> fₓ(p1,p2,cutoff,side))
+    forces! = (f,x) -> forces!(f,x, (i,j,p1,p2) -> fₓ(p1,p2,cutoff,side)),
+    side = side
 )...) 
 
 # Vizualizing the trajectory with uncertainties
@@ -336,9 +302,9 @@ anim_2D_error = @animate for frame in trajectory_2D_error
 end
 
 # Save as GIF
-gif_path = joinpath(@__DIR__, "trajectory_2D_error.gif")
+gif_path = joinpath(gif_dir, "trajectory_2D_error.gif")
 gif(anim_2D_error, gif_path, fps=20)
-=#
+
 # Speeding up the code using cell lists
 using CellListMap # package that divides the domain into cells and only computes interactions between particles in neighboring cells
 import CellListMap: Box, CellList, UpdateCellList!, map_pairwise!
@@ -370,25 +336,27 @@ function forces_cl!(f::Vector{T},x,box::Box,cl::CellList,fpair::F) where {T,F}
     )
     return f
 end
-#=
-t_naive = @elapsed trajectory_periodic_large = md((
+
+t_naive = @elapsed trajectory_periodic_large = md_wrap((
     x0 = x0_large, 
     v0 = [random_vec(Vec2D{Float64},(-1,1)) for _ in 1:n_large ], 
     mass = [ 10.0 for _ in 1:n_large ],
     dt = 0.1,
     nsteps = 1000,
     isave = 10,
-    forces! = (f,x) -> forces!(f,x,(i,j,p1,p2) -> fₓ(p1,p2,cutoff,box_side))
+    forces! = (f,x) -> forces!(f,x,(i,j,p1,p2) -> fₓ(p1,p2,cutoff,box_side)),
+    side = box_side
 )...)
 
-t_cell_lists = @elapsed trajectory_cell_lists = md((
+t_cell_lists = @elapsed trajectory_cell_lists = md_wrap((
     x0 = x0_large, 
     v0 = [random_vec(Vec2D{Float64},(-1,1)) for _ in 1:n_large ], 
     mass = [ 10.0 for _ in 1:n_large ],
     dt = 0.1,
     nsteps = 1000,
     isave = 10,
-    forces! = (f,x) -> forces_cl!(f,x,box,cl,fpair_cl)
+    forces! = (f,x) -> forces_cl!(f,x,box,cl,fpair_cl),
+    side = box_side
 )...)
 
 println("Time taken without cell lists: ",t_naive," seconds")
@@ -407,9 +375,9 @@ anim_cell_lists = @animate for frame in trajectory_cell_lists
 end
 
 # Save as GIF
-gif_path = joinpath(@__DIR__, "trajectory_cell_lists.gif")
+gif_path = joinpath(gif_dir, "trajectory_cell_lists.gif")
 gif(anim_cell_lists, gif_path, fps=20)
-=#
+
 # One can definie the potential energy of the system differently by changing the energy function defined earlier
 
 using FastPow # package for fast exponentiation
@@ -460,7 +428,7 @@ function flj!(f::Vector{T},x,ε,σ,box,cl,box_side) where T
     )
     return f
 end
-#=
+
 # For Neon Gas
 const ε = 0.0441795 # kcal/mol
 const σ = 2*1.64009 # Å
@@ -469,14 +437,15 @@ const box_side_Ne = (10_000/0.1)^(1/3) # box side length for density of 0.1 atom
 x0_Ne = [ random_vec(Vec3D{Float64},(-box_side_Ne/2,box_side_Ne/2)) for _ in 1:n_Ne ]
 const box_Ne = Box([box_side_Ne,box_side_Ne,box_side_Ne],3σ) # cutoff of 3σ
 const cl_Ne = CellList(x0_Ne,box_Ne)
-t_Ne = @elapsed trajectory_Ne = md((
+t_Ne = @elapsed trajectory_Ne = md_wrap((
     x0 = x0_Ne, 
     v0 = [random_vec(Vec3D{Float64},(-0.1,0.1)) for _ in 1:n_Ne ], 
     mass = [ 20.18 for _ in 1:n_Ne ], # mass of neon atom in amu
     dt = .001,
     nsteps = 100,
     isave = 1,
-    forces! = (f,x) -> flj!(f,x,ε,σ,box_Ne,cl_Ne,box_side_Ne)
+    forces! = (f,x) -> flj!(f,x,ε,σ,box_Ne,cl_Ne,box_side_Ne),
+    side = box_side_Ne
 )...)
 println("Time taken for Neon gas simulation: ",t_Ne," seconds")
 # Visualizing a slice of the Neon gas trajectory
@@ -492,127 +461,7 @@ anim_Ne = @animate for frame in trajectory_Ne
     )
 end
 # Save as GIF
-gif_path = joinpath(@__DIR__, "trajectory_Ne_slice.gif")
+
+gif_path = joinpath(gif_dir, "trajectory_Ne_slice.gif")
 gif(anim_Ne, gif_path, fps=20)
-=#
-const a_ww = -25
-const a_oo = -25
-const a_ow = -50
 
-function f_emulsion_pair!(i,j,x::T,y::T,cutoff,side,a_ij,f) where T
-    Δv = wrap.(y - x, side)
-    d = norm(Δv)
-    if d > cutoff
-        fₓ = zero(T)
-    elseif d<0.01
-        fₓ = 3000*(1-d/cutoff)*(Δv/d)
-    else
-        fₓ = a_ij*(1-d/cutoff)*(Δv/d)
-    end
-    f[i] += fₓ
-    f[j] -= fₓ
-    return f
-end
-
-function femulsion_plot(d,cutoff,a_ij)
-    in_repulsive = a_ij == a_oo
-    if d > cutoff
-        fₓ = 0
-    elseif d < 0.01 && in_repulsive
-        fₓ = 3000*(1-d/cutoff)
-    else
-        fₓ = a_ij*(1-d/cutoff)
-    end
-    return fₓ
-end
-# Plotting the emulsion forces between particles
-
-using Plots
-d_values = 0:0.01:1.5*cutoff
-f_oo = [ femulsion_plot(d,cutoff,a_oo) for d in d_values ]
-f_ww = [ femulsion_plot(d,cutoff,a_ww) for d in d_values ]
-f_ow = [ femulsion_plot(d,cutoff,a_ow) for d in d_values ]
-plot(
-    d_values, f_oo,
-    label="Oil-Oil Interaction",
-    xlabel="Distance", ylabel="Force Magnitude",
-    title="Emulsion Interaction Forces",
-    legend=:topright,
-    linewidth=2,
-)
-plot!(
-    d_values, f_ww,
-    label="Water-Water Interaction",
-    linewidth=2,
-)
-plot!(
-    d_values, f_ow,
-    label="Oil-Water Interaction",
-    linewidth=2,
-)
-savefig(joinpath(@__DIR__, "emulsion_forces.png"))
-
-const cutoff_emulsion = 1
-const box_side = 32.2
-const volume_fraction_oil = 0.90
-const volume_oil = volume_fraction_oil * box_side^2
-const density_number = 3
-const n_oil::Int = ceil(volume_oil * density_number)
-const n_water::Int = ceil((box_side^2 - volume_oil) * density_number)
-const n_total = n_oil + n_water
-x0_oil = [ random_vec(Vec2D{Float64},(-box_side/2,box_side/2)) for _ in 1:n_oil ]
-x0_water = [ random_vec(Vec2D{Float64},(-box_side/2,box_side/2)) for _ in 1:n_water ]
-x0_emulsion = vcat(x0_oil,x0_water)
-f0_emulsion = similar(x0_emulsion)
-box_emulsion = Box([box_side,box_side],cutoff_emulsion)
-cl_emulsion = CellList(x0_emulsion,box_emulsion)
-function forces_emulsion!(f::Vector{T},x,box::Box,side,cl::CellList,n_oil,n_water,fpair::F) where {T,F}
-    fill!(f,zero(T))
-    cl = UpdateCellList!(x,box,cl,parallel=false)
-    map_pairwise!(
-        (x,y,i,j,d2,f) -> begin
-            if i <= n_oil && j <= n_oil
-                f_emulsion_pair(i,j,x,y,box.cutoff,side,a_oo,f)
-            elseif i > n_oil && j > n_oil
-                f_emulsion_pair(i,j,x,y,box.cutoff,side,a_ww,f)
-            else
-                f_emulsion_pair(i,j,x,y,box.cutoff,side,a_ow,f)
-            end
-        end,
-        f, box, cl,
-        parallel=true
-    )
-    return f
-end
-t_emulsion = @elapsed trajectory_emulsion = md_Verlet((
-    x0 = x0_emulsion, 
-    v0 = [random_vec(Vec2D{Float64},(-0.1,0.1)) for _ in 1:n_total ], 
-    mass = [ 1.0 for _ in 1:n_total ],
-    dt = .01,
-    nsteps = 3*10^6,
-    isave = 1000,
-    forces! = (f,x) -> forces_emulsion!(f,x,box_emulsion,box_side,cl_emulsion,n_oil,n_water,fpair_cl)
-)...)
-
-println("Time taken for emulsion simulation: ",t_emulsion," seconds")
-# Visualizing the emulsion trajectory
-anim_emulsion = @animate for frame in trajectory_emulsion
-    scatter(
-        [ p.x for p in frame[1:n_oil] ],
-        [ p.y for p in frame[1:n_oil] ],
-        xlim=(-box_side/2,box_side/2), ylim=(-box_side/2,box_side/2),
-        title="Emulsion MD Simulation",
-        xlabel="X Position", ylabel="Y Position",
-        markersize=2,
-        color=:orange,
-    )
-    scatter!(
-        [ p.x for p in frame[n_oil+1:end] ],
-        [ p.y for p in frame[n_oil+1:end] ],
-        markersize=2,
-        color=:blue,
-    )
-end
-# Save as GIF
-gif_path = joinpath(@__DIR__, "trajectory_emulsion_vf_$(volume_fraction_oil).gif")
-gif(anim_emulsion, gif_path, fps=20)
