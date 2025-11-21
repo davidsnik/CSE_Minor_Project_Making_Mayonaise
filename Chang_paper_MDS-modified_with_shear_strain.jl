@@ -361,7 +361,7 @@ for volume_fraction_oil in [0.2, 0.4, 0.6, 0.8, 0.95]
     box_emulsion = Box([box_side,box_side],cutoff)
     cl_emulsion = CellList(x0_emulsion,box_emulsion)
 
-    save_every_n_frames = 100
+    isave = 100
 
     t_emulsion = @elapsed trajectory_emulsion, sigma_xy = md_Verlet((
         x0 = x0_emulsion, 
@@ -370,7 +370,7 @@ for volume_fraction_oil in [0.2, 0.4, 0.6, 0.8, 0.95]
         dt = dt,
         box_side = box_side,
         nsteps = nsteps,
-        isave = nsteps/save_every_n_frames,
+        isave = isave,
         forces! = (f,x) -> forces_emulsion!(f,x,box_emulsion,box_side,cl_emulsion,n_oil,n_water,f_emulsion_pair!)
     )...)
     println("Time taken for emulsion simulation: ",t_emulsion," seconds")
@@ -417,6 +417,6 @@ for volume_fraction_oil in [0.2, 0.4, 0.6, 0.8, 0.95]
         end
         # Save as GIF
         gif_path = joinpath(gif_dir, "trajectory_emulsion_vf_$(volume_fraction_oil)_$(nsteps)_$(dt).gif")
-        gif(anim_emulsion, gif_path, fps=save_every_n_frames/dt)
+        gif(anim_emulsion, gif_path, fps=isave/dt)
     end
 end
