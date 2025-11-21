@@ -218,6 +218,7 @@ for volume_fraction_oil in [0.2, 0.4, 0.6, 0.8, 0.95]
     println("Number of water particles out of bounds: ",water_out)
     println("Percent of particles sent to infinity: ", (oil_out + water_out) / n_total * 100, "%")
 
+    
     # Visualizing the emulsion trajectory
     anim_emulsion = @animate for frame in trajectory_emulsion
         scatter(
