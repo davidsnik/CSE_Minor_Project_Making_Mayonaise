@@ -33,15 +33,23 @@ begin
     )    
 end
 
-# Implementing periodic boundary conditions (as the domain is wrapped in a ring)
-function wrap(x,side)
-    x = rem(x,side) #  like mod(x,side) but works for negative x (returns negative values)
-    if x >= side/2 # if distance is more than half the side then the particles are closer through the other side
-        x -= side
-    elseif x < -side/2 # same logic for negative vector
-        x += side
+# Periodic only in x (no wrapping in y)
+@inline function wrap_x(dx::T, side::T) where T
+    dx = rem(dx, side)
+    if dx >= side/2
+        dx -= side
+    elseif dx < -side/2
+        dx += side
     end
-    return x
+    return dx
+end
+
+# Apply x-periodic BC only to a subset of particles (the bulk)
+function apply_x_periodic_bulk!(x::Vector{Vec2D{T}}, side::T, bulk_ids) where T
+    @inbounds for i in bulk_ids
+        xi = x[i]
+        x[i] = Vec2D(wrap_x(xi.x, side), xi.y)
+    end
 end
 
 # Compute shear stress sigma_xy from positions x, velocities v, and forces f
@@ -66,63 +74,139 @@ function shear_stress_xy(x::Vector{Vec2D{T}},
     return sigma_xy
 end
 
-#Molecular Dynamics simulator using velocity Verlet algorithm
-function md_Verlet(x0::Vector{T}, v0::Vector{T}, mass, dt, box_side, nsteps, isave, forces!) where T
-    #=
-    x0: Initial positions of particles (vector of T)
-    v0: Initial velocities of particles (vector of T)
-    =#
+function confine_y_bulk!(x::Vector{Vec2D{T}}, v::Vector{Vec2D{T}},
+                         y_min::T, y_max::T, bulk_ids) where T
+    @inbounds for i in bulk_ids
+        xi = x[i]
+        yi = xi.y
+        if yi > y_max
+            # reflect position
+            new_y = 2*y_max - yi
+            x[i] = Vec2D(xi.x, new_y)
+            # reverse normal velocity (bounce)
+            v[i] = Vec2D(v[i].x, -v[i].y)
+        elseif yi < y_min
+            new_y = 2*y_min - yi
+            x[i] = Vec2D(xi.x, new_y)
+            v[i] = Vec2D(v[i].x, -v[i].y)
+        end
+    end
+end
 
+function md_Verlet_walls(x0::Vector{T}, v0::Vector{T}, mass,
+                         dt, box_side, nsteps, isave, forces!,
+                         bulk_ids, topwall_ids, botwall_ids;
+                         U_top::Real, U_bot::Real = 0.0) where T
+
+    # Copy initial state
     x = copy(x0)
     v = copy(v0)
-    a = similar(x0)
-    f = similar(x0) # Initialize force vector
-    trajectory = [ copy(x0) ] # will store the trajectory
-    sigma_xy_series = Float64[]
-    
+    f = similar(x0)
+
+    # Initial forces
+    forces!(f, x)
+
+    trajectory       = Vector{Vector{T}}(undef, 0)
+    sigma_xy_series  = Float64[]
+
+    push!(trajectory, copy(x))
+
+    # Main loop
     for step in 1:nsteps
-        # Compute forces and store in f
-        forces!(f,x)
-        # Accelerations (@. means element-wise operation)
-        @. a = f / mass
-        # Update positions
-        @. x = x + v*dt + a*dt^2/2
-        for i in 1:length(x)
-            x[i] = wrap.(x[i],box_side) # ensure positions are wrapped within the box
+        # --- half-step velocity update (bulk only) ---
+        @inbounds for i in bulk_ids
+            v[i] += 0.5 * (f[i] / mass[i]) * dt
         end
-        # Update velocities only at half-time step
-        @. v = v + 0.5*a*dt
-        # Recompute forces at new positions
-        forces!(f,x)
-        # Update accelerations
-        @. a = f / mass
-        # Complete velocity update
-        @. v = v + 0.5*a*dt
-        # Compute sigma xy
+
+        # --- full position update for bulk ---
+        @inbounds for i in bulk_ids
+            x[i] += v[i] * dt
+        end
+
+        # confine bulk between the walls (just inside them)
+        y_min = -box_side/2 + 0.5*cutoff   # or use same y_offset as wall generation
+        y_max =  box_side/2 - 0.5*cutoff
+        confine_y_bulk!(x, v, y_min, y_max, bulk_ids)
+
+        # --- apply periodic BC in x only to bulk ---
+        apply_x_periodic_bulk!(x, box_side, bulk_ids)
+
+        # --- move walls with prescribed velocities (and wrap in x) ---
+        @inbounds for i in topwall_ids
+            # prescribe horizontal velocity only
+            v[i] = Vec2D(U_top, 0.0)
+            xi = x[i]
+            x_new_x = wrap_x(xi.x + U_top * dt, box_side)
+            # keep the original / jittered y position
+            x[i] = Vec2D(x_new_x, xi.y)
+        end
+
+        @inbounds for i in botwall_ids
+            v[i] = Vec2D(U_bot, 0.0)
+            xi = x[i]
+            x_new_x = wrap_x(xi.x + U_bot * dt, box_side)
+            x[i] = Vec2D(x_new_x, xi.y)
+        end
+
+        # --- compute new forces at updated positions ---
+        forces!(f, x)
+
+        # --- second half-step velocity update (bulk only) ---
+        @inbounds for i in bulk_ids
+            v[i] += 0.5 * (f[i] / mass[i]) * dt
+        end
+
+        # --- compute shear stress (you can restrict to bulk if you want) ---
         sigma_xy = shear_stress_xy(x, v, f, mass, box_side)
-        # Save the trajectory at specified intervals
-        if mod(step,isave) == 0
-            println("Saved trajectory at step: ",step, " with sigma_xy: ", sigma_xy)
-            push!(trajectory,copy(x))
+
+        if step % isave == 0
+            push!(trajectory, copy(x))
             push!(sigma_xy_series, sigma_xy)
         end
     end
-    return trajectory, mean(sigma_xy_series[ceil(Int, 0.7*length(sigma_xy_series)):end])
+
+    # Time-average over last 30% of saved samples
+    if !isempty(sigma_xy_series)
+        i0 = ceil(Int, 0.7 * length(sigma_xy_series))
+        return trajectory, mean(sigma_xy_series[i0:end])
+    else
+        return trajectory, NaN
+    end
 end
 
 # function that calculates pairwise forces between oil and water particles in an emulsion
-function forces_emulsion!(f::Vector{T},x,box::Box,side,cl::CellList,n_oil,n_water,fpair::F) where {T,F}
+function forces_emulsion!(f::Vector{T}, x,
+                          box::Box, side, cl::CellList,
+                          n_oil, n_water, n_wall,
+                          fpair::F) where {T,F}
     fill!(f,zero(T))
     cl = UpdateCellList!(x,box,cl,parallel=false)
     map_pairwise!(
         (x,y,i,j,d2,f) -> begin
-            if i <= n_oil && j <= n_oil
-                fpair(i,j,x,y,box.cutoff,side,a_oo,f)
-            elseif i > n_oil && j > n_oil
-                fpair(i,j,x,y,box.cutoff,side,a_ww,f)
-            else
-                fpair(i,j,x,y,box.cutoff,side,a_ow,f)
+            # index ranges
+            i_oil   = i <= n_oil
+            j_oil   = j <= n_oil
+            i_water = (n_oil < i <= n_oil + n_water)
+            j_water = (n_oil < j <= n_oil + n_water)
+            # walls are the rest
+            i_wall  = !(i_oil || i_water)
+            j_wall  = !(j_oil || j_water)
+
+            if i_oil && j_oil
+                a = a_oil_oil
+            elseif i_water && j_water
+                a = a_water_water
+            elseif i_wall && j_wall
+                a = a_wall_wall
+            elseif (i_oil && j_water) || (i_water && j_oil)
+                a = a_oil_water               # oil–water
+            elseif (i_oil && j_wall) || (i_wall && j_oil)
+                a = a_wall_oil         # oil–wall
+            else # (i_water && j_wall) || (i_wall && j_water)
+                a = a_wall_water       # water–wall
             end
+
+            fpair(i, j, x, y, box.cutoff, side, a, f)
         end,
         f, box, cl,
         parallel=true
@@ -130,18 +214,29 @@ function forces_emulsion!(f::Vector{T},x,box::Box,side,cl::CellList,n_oil,n_wate
     return f
 end
 
-# Force calculation between a pair of emulsion particles
-function f_emulsion_pair!(i,j,x::T,y::T,cutoff,side,a_ij,f) where T
-    Δv = wrap.(y - x, side)
+function f_emulsion_pair_shear!(i, j,
+                                x::T, y::T,
+                                cutoff, side, a_ij,
+                                f) where T
+
+    Δ = y - x                  # works for SVector and Vec2D
+    Δx = wrap_x(Δ[1], side)    # minimum image only in x
+    Δy = Δ[2]                  # direct distance in y
+
+    # construct displacement with the SAME type as x,y (T can be Vec2D or SVector)
+    Δv = T(Δx, Δy)
+
     d = norm(Δv)
-    in_repulsive = a_ij == a_oo
+    in_repulsive = a_ij == a_oil_oil
+
     if d > cutoff
         fₓ = zero(T)
-    elseif d<1e-12 && in_repulsive
-        fₓ = 3000*(1-d/cutoff)*(Δv/d)
+    elseif d < 1e-12 && in_repulsive
+        fₓ = 3000 * (1 - d/cutoff) * (Δv / d)
     else
-        fₓ = a_ij*(1-d/cutoff)*(Δv/d)
+        fₓ = a_ij * (1 - d/cutoff) * (Δv / d)
     end
+
     f[i] += fₓ
     f[j] -= fₓ
     return f
@@ -149,7 +244,7 @@ end
 
 # Function to plot emulsion interaction forces (to see how they behave with distance)
 function femulsion_plot(d,cutoff,a_ij)
-    in_repulsive = a_ij == a_oo
+    in_repulsive = a_ij == a_oil_oil
     if d > cutoff
         fₓ = 0
     elseif d < 1e-12 && in_repulsive
@@ -160,18 +255,22 @@ function femulsion_plot(d,cutoff,a_ij)
     return fₓ
 end
 
+# TODO these values have to be tweak
 # defining repulsion parameters
-const cutoff = 1
-const a_ww = -25
-const a_oo = -25
-const a_ow = -80
+const cutoff = 1.0
+const a_water_water = -25.0
+const a_oil_oil     = -25.0
+const a_oil_water   = -80.0
+const a_wall_wall   = -25.0
+const a_wall_water  = -25.0
+const a_wall_oil    = -80.0
 
 # Plotting the emulsion forces between particles
 using Plots
 d_values = 0:0.01:1.5*cutoff
-f_oo = [ femulsion_plot(d,cutoff,a_oo) for d in d_values ]
-f_ww = [ femulsion_plot(d,cutoff,a_ww) for d in d_values ]
-f_ow = [ femulsion_plot(d,cutoff,a_ow) for d in d_values ]
+f_oo = [ femulsion_plot(d,cutoff,a_oil_oil) for d in d_values ]
+f_ww = [ femulsion_plot(d,cutoff,a_water_water) for d in d_values ]
+f_ow = [ femulsion_plot(d,cutoff,a_oil_water) for d in d_values ]
 
 if output_plots
     plot(
@@ -215,8 +314,8 @@ function generate_droplet_centers(n_droplets::Int,
 
     x_min = -box_side/2 + R
     x_max =  box_side/2 - R
-    y_min = -box_side/2 + R
-    y_max =  box_side/2 - R
+    y_min = -box_side/2 + (R + cutoff)
+    y_max =  box_side/2 - (R + cutoff)
 
     max_attempts = 10000
     attempt = 0
@@ -271,152 +370,277 @@ end
 
 # Generate water particles outside all droplets
 function generate_outside_droplets(n_water::Int,
-                                         centers::Vector{Vec2D{T}},
-                                         R::T,
-                                         box_side::T) where T
+                                   centers::Vector{Vec2D{T}},
+                                   R::T,
+                                   box_side::T,
+                                   walls::Vector{Vec2D{T}} = Vec2D{T}[];
+                                   wall_buffer::T = 0.5*cutoff) where T
     water = Vec2D{T}[]
     x_min, x_max = -box_side/2, box_side/2
-    y_min, y_max = -box_side/2, box_side/2
+    # keep away from walls in y by a small buffer as well
+    y_min, y_max = -box_side/2 + wall_buffer, box_side/2 - wall_buffer
+    wall_buffer2 = wall_buffer^2
 
-    while length(water) < n_water
-        p = random_vec(Vec2D{T}, (x_min, x_max))
-        # keep p only if it is outside every droplet
-        if all(norm(p - c) > R for c in centers)
+    max_attempts = 2_000_000
+    attempts = 0
+
+    while length(water) < n_water && attempts < max_attempts
+        attempts += 1
+
+        # sample x uniformly
+        px = x_min + rand(T)*(x_max - x_min)
+        # sample y in interior
+        py = y_min + rand(T)*(y_max - y_min)
+        p = Vec2D(px, py)
+
+        # outside every droplet?
+        inside_any_droplet = any(norm(p - c) <= R for c in centers)
+
+        # not too close to any wall bead?
+        close_to_wall = false
+        @inbounds for w in walls
+            dx = wrap_x(p.x - w.x, box_side)
+            dy = p.y - w.y
+            if dx*dx + dy*dy < wall_buffer2
+                close_to_wall = true
+                break
+            end
+        end
+
+        if !inside_any_droplet && !close_to_wall
             push!(water, p)
         end
+
+        # optional: lightweight progress print every so often
+        if attempts % 200_000 == 0
+            println("Placed $(length(water)) / $(n_water) water after $attempts attempts")
+        end
+    end
+
+    if length(water) < n_water
+        println("WARNING: only placed $(length(water)) of $(n_water) water particles. ",
+                "Relax constraints (wall_buffer, droplet radius, density) or reduce n_water.")
     end
 
     return water
 end
 
+
+function make_rough_wall_particles(
+        VecType::Type{Vec2D{T}},
+        box_side::T,
+        n_per_wall::Int;
+        y_offset::T = 0.0,
+        y_amp::T = 0.5*cutoff,   # vertical roughness amplitude
+    ) where T
+
+    dx = box_side / n_per_wall
+    x_start = -box_side/2 + dx/2
+
+    x_top_vec = VecType[]
+    x_bot_vec = VecType[]
+
+    # Roughness parameters
+    jitter_amp = 0.3 * dx       # horizontal jitter in x
+
+    for k in 0:(n_per_wall-1)
+        xk = x_start + k*dx
+
+        # Top wall: random x and y slightly below +box_side/2
+        x_top_pos = xk + (2*rand(T) - one(T)) * jitter_amp
+        x_top_pos = wrap_x(x_top_pos, box_side)
+        y_top_pos = box_side/2 - y_offset - rand(T)*y_amp
+
+        # Bottom wall: random x and y slightly above -box_side/2
+        x_bot_pos = xk + (2*rand(T) - one(T)) * jitter_amp
+        x_bot_pos = wrap_x(x_bot_pos, box_side)
+        y_bot_pos = -box_side/2 + y_offset + rand(T)*y_amp
+
+        push!(x_top_vec, VecType(x_top_pos, y_top_pos))
+        push!(x_bot_vec, VecType(x_bot_pos, y_bot_pos))
+    end
+
+    return x_top_vec, x_bot_vec
+end
+
+function wall_velocity_from_shear(applied_shear, nsteps, dt, box_side; cutoff_local = cutoff)
+    H = box_side - cutoff_local      # effective gap between walls
+    T = nsteps * dt                  # total simulation time
+    return applied_shear * H / T
+end
+
 for volume_fraction_oil in [0.2, 0.4, 0.6, 0.8, 0.95]
-
-    volume_oil   = volume_fraction_oil * box_side^2
-    volume_water = (1.0 - volume_fraction_oil) * box_side^2
-    n_oil::Int   = ceil(volume_oil * density_number)
-    n_water::Int = ceil((box_side^2 - volume_oil) * density_number)
-    n_total      = n_oil + n_water
-
-    n_droplets = 4
+    for applied_shear in [1.0]
+        volume_oil   = volume_fraction_oil * box_side^2
+        volume_water = (1.0 - volume_fraction_oil) * box_side^2
+        n_oil::Int   = ceil(volume_oil * density_number)
+        n_water::Int = ceil((box_side^2 - volume_oil) * density_number)
     
-    x0_oil, x0_water = if volume_fraction_oil <= 0.5
-        droplet_area = volume_oil / n_droplets          # area of ONE droplet
-        R_droplet    = sqrt(droplet_area / pi)           # same R used for centers
-
-        # pick droplet centers
-        centers = generate_droplet_centers(
-            n_droplets,
-            box_side,
-            R_droplet;
-            margin_factor = 1.5,
+        n_droplets = 4
+    
+        n_per_wall = 400
+        x_top, x_bot = make_rough_wall_particles(Vec2D{Float64}, box_side, n_per_wall;
+                                                 y_offset = 0.0)
+        walls = vcat(x_top, x_bot)
+    
+        x0_oil, x0_water = if volume_fraction_oil <= 0.5
+            droplet_area = volume_oil / n_droplets          # area of ONE droplet
+            R_droplet    = sqrt(droplet_area / pi)
+    
+            centers = generate_droplet_centers(
+                n_droplets,
+                box_side,
+                R_droplet;
+                margin_factor = 1.5,
+            )
+    
+            x0_oil, R_used = generate_multi_droplet(
+                n_oil,
+                centers,
+                droplet_area,
+            )
+    
+            x0_water = generate_outside_droplets(
+                n_water,
+                centers,
+                R_used,
+                box_side,
+                walls,             # <- avoid walls too
+            )
+    
+            x0_oil, x0_water
+        else
+            droplet_area = volume_water / n_droplets
+            R_droplet    = sqrt(droplet_area / pi)
+    
+            centers = generate_droplet_centers(
+                n_droplets,
+                box_side,
+                R_droplet;
+                margin_factor = 1.5,
+            )
+    
+            x0_water, R_used = generate_multi_droplet(
+                n_water,
+                centers,
+                droplet_area,
+            )
+    
+            x0_oil = generate_outside_droplets(
+                n_oil,
+                centers,
+                R_used,
+                box_side,
+                walls,             # <- avoid walls too
+            )
+    
+            x0_oil, x0_water
+        end
+    
+        x0_emulsion = vcat(x0_oil, x0_water)
+        x0_all      = vcat(x0_emulsion, walls)
+    
+        box_emulsion = Box([box_side, box_side], cutoff)
+        cl_emulsion  = CellList(x0_all, box_emulsion)
+    
+        n_bulk   = length(x0_emulsion)   # = n_oil + n_water
+        n_wall   = length(walls)
+        n_total  = n_bulk + n_wall
+        n_topwall  = length(x_top)
+        n_botwall  = length(x_bot)
+        n_total    = length(x0_all)
+    
+        bulk_ids    = 1:n_bulk
+        topwall_ids = (n_bulk+1):(n_bulk+n_topwall)
+        botwall_ids = (n_bulk+n_topwall+1):(n_total)
+    
+        isave = 100
+    
+        v0_all = [random_vec(Vec2D{Float64},(-0.1,0.1)) for _ in 1:n_bulk]
+        append!(v0_all, [Vec2D(0.0, 0.0) for _ in 1:(n_topwall+n_botwall)])
+    
+        mass_all = [1.0 for _ in 1:n_total]
+        U_wall   = wall_velocity_from_shear(applied_shear, nsteps, dt, box_side)
+    
+        t_emulsion = @elapsed trajectory_emulsion, sigma_xy = md_Verlet_walls(
+            x0_all, v0_all, mass_all,
+            dt, box_side, nsteps, isave,
+            (f,x) -> forces_emulsion!(f, x, box_emulsion, box_side,
+                              cl_emulsion, n_oil, n_water, n_wall,
+                              f_emulsion_pair_shear!),
+            bulk_ids, topwall_ids, botwall_ids;
+            U_top = U_wall, U_bot = 0.0,
         )
-
-        # generate oil inside droplets
-        x0_oil, R_used = generate_multi_droplet(
-            n_oil,
-            centers,
-            droplet_area,
-        )
-
-        # generate water outside droplets
-        x0_water = generate_outside_droplets(
-            n_water,
-            centers,
-            R_used,
-            box_side,
-        )
-
-        x0_oil, x0_water
-    else
-        droplet_area = volume_water / n_droplets          # area of ONE droplet
-        R_droplet    = sqrt(droplet_area / pi)           # same R used for centers
-
-        # pick droplet centers
-        centers = generate_droplet_centers(
-            n_droplets,
-            box_side,
-            R_droplet;
-            margin_factor = 1.5,
-        )
-
-        # generate oil inside droplets
-        x0_water, R_used = generate_multi_droplet(
-            n_water,
-            centers,
-            droplet_area,
-        )
-
-        # generate water outside droplets
-        x0_oil = generate_outside_droplets(
-            n_oil,
-            centers,
-            R_used,
-            box_side,
-        )
-
-        x0_oil, x0_water
-    end
-
-    x0_emulsion = vcat(x0_oil, x0_water)
-    box_emulsion = Box([box_side,box_side],cutoff)
-    cl_emulsion = CellList(x0_emulsion,box_emulsion)
-
-    isave = 100
-
-    t_emulsion = @elapsed trajectory_emulsion, sigma_xy = md_Verlet((
-        x0 = x0_emulsion, 
-        v0 = [random_vec(Vec2D{Float64},(-0.1,0.1)) for _ in 1:n_total ], 
-        mass = [ 1.0 for _ in 1:n_total ],
-        dt = dt,
-        box_side = box_side,
-        nsteps = nsteps,
-        isave = isave,
-        forces! = (f,x) -> forces_emulsion!(f,x,box_emulsion,box_side,cl_emulsion,n_oil,n_water,f_emulsion_pair!)
-    )...)
-    println("Time taken for emulsion simulation: ",t_emulsion," seconds")
-    println("Sigma_xy: ", sigma_xy)
-
-    # Analyzing emulsion stability 
-    println("Number of oil particles at the beginning: ",n_oil,", Number of water particles at the beginning: ",n_water, ", Total particles: ",n_total)
-    oil_out = 0
-    water_out = 0
-    for fram in trajectory_emulsion
-        for p in fram[1:n_oil]
-            if abs(p.x) > box_side/2 || abs(p.y) > box_side/2
-                oil_out += 1
+    
+        println("Time taken for emulsion simulation: ",t_emulsion," seconds")
+        println("Sigma_xy: ", sigma_xy)
+    
+        # Analyzing emulsion stability 
+        println("Number of oil particles at the beginning: ",n_oil,", Number of water particles at the beginning: ",n_water, ", Total particles: ",n_total)
+        println("Number of oil particles at the beginning: ", n_oil,
+            ", Number of water particles at the beginning: ", n_water,
+            ", Total particles: ", n_total)
+    
+        oil_oob = falses(n_oil)
+        water_oob = falses(n_water)
+    
+        for fram in trajectory_emulsion
+            # oil
+            for (k,p) in enumerate(fram[1:n_oil])
+                if abs(p.x) > box_side/2 || abs(p.y) > box_side/2
+                    oil_oob[k] = true
+                end
+            end
+            # water ONLY (exclude walls)
+            for (k,p) in enumerate(fram[n_oil+1 : n_oil+n_water])
+                if abs(p.x) > box_side/2 || abs(p.y) > box_side/2
+                    water_oob[k] = true
+                end
             end
         end
-        for p in fram[n_oil+1:end]
-            if abs(p.x) > box_side/2 || abs(p.y) > box_side/2
-                water_out += 1
+    
+        n_oil_oob   = count(oil_oob)
+        n_water_oob = count(water_oob)
+    
+        println("Unique oil particles ever out of bounds: ", n_oil_oob)
+        println("Unique water particles ever out of bounds: ", n_water_oob)
+        println("Percent of particles ever out of bounds: ",
+                (n_oil_oob + n_water_oob) / n_total * 100, "%")
+    
+        if output_plots
+            anim_emulsion = @animate for frame in trajectory_emulsion
+                # Oil particles
+                scatter(
+                    [p.x for p in frame[1:n_oil]],
+                    [p.y for p in frame[1:n_oil]],
+                    xlim = (-box_side/2, box_side/2),
+                    ylim = (-box_side/2, box_side/2),
+                    title = "Emulsion MD Simulation, vf = $(volume_fraction_oil)",
+                    xlabel = "X Position",
+                    ylabel = "Y Position",
+                    markersize = 2,
+                    color = :orange,
+                )
+    
+                # Water particles
+                scatter!(
+                    [p.x for p in frame[n_oil+1 : n_oil+n_water]],
+                    [p.y for p in frame[n_oil+1 : n_oil+n_water]],
+                    markersize = 2,
+                    color = :blue,
+                )
+    
+                # Wall particles (last chunk)
+                scatter!(
+                    [p.x for p in frame[n_oil+n_water+1 : end]],
+                    [p.y for p in frame[n_oil+n_water+1 : end]],
+                    markersize = 3,
+                    color = :red,
+                )
             end
+    
+            gif_path = joinpath(gif_dir, "trajectory_emulsion_vf_$(volume_fraction_oil)_$(nsteps)_$(dt).gif")
+            gif(anim_emulsion, gif_path, fps = isave/dt)
         end
-    end
-    println("Number of oil particles out of bounds: ",oil_out)
-    println("Number of water particles out of bounds: ",water_out)
-    println("Percent of particles sent to infinity: ", (oil_out + water_out) / n_total * 100, "%")
-
-    if output_plots
-        # Visualizing the emulsion trajectory
-        anim_emulsion = @animate for frame in trajectory_emulsion
-            scatter(
-                [ p.x for p in frame[1:n_oil] ],
-                [ p.y for p in frame[1:n_oil] ],
-                xlim=(-box_side/2,box_side/2), ylim=(-box_side/2,box_side/2),
-                title="Emulsion MD Simulation",
-                xlabel="X Position", ylabel="Y Position",
-                markersize=2,
-                color=:orange,
-            )
-            scatter!(
-                [ p.x for p in frame[n_oil+1:end] ],
-                [ p.y for p in frame[n_oil+1:end] ],
-                markersize=2,
-                color=:blue,
-            )
-        end
-        # Save as GIF
-        gif_path = joinpath(gif_dir, "trajectory_emulsion_vf_$(volume_fraction_oil)_$(nsteps)_$(dt).gif")
-        gif(anim_emulsion, gif_path, fps=isave/dt)
     end
 end
