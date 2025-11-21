@@ -2,7 +2,9 @@ using CellListMap # package that divides the domain into cells and only computes
 import CellListMap: Box, CellList, UpdateCellList!, map_pairwise!
 using StaticArrays
 import LinearAlgebra: norm
+using Statistics: mean
 
+output_plots = true
 
 # Defnition of a position vector for each particle
 struct Vec2D{T} <: FieldVector{2,T} # A 2D vector with components of type T
@@ -42,6 +44,28 @@ function wrap(x,side)
     return x
 end
 
+# Compute shear stress sigma_xy from positions x, velocities v, and forces f
+function shear_stress_xy(x::Vector{Vec2D{T}},
+                         v::Vector{Vec2D{T}},
+                         f::Vector{Vec2D{T}},
+                         mass,
+                         box_side::T) where T
+    A = box_side^2        # 2D "volume" = area
+
+    sigma_kin = 0.0           # kinetic contribution
+    sigma_vir = 0.0           # virial (configurational) contribution
+
+    @inbounds for i in eachindex(x)
+        # kinetic part: m v_x v_y
+        sigma_kin += mass[i] * v[i].x * v[i].y
+        # virial part: x_x * F_y
+        sigma_vir += x[i].x * f[i].y
+    end
+
+    sigma_xy = (sigma_kin + sigma_vir) / A
+    return sigma_xy
+end
+
 #Molecular Dynamics simulator using velocity Verlet algorithm
 function md_Verlet(x0::Vector{T}, v0::Vector{T}, mass, dt, box_side, nsteps, isave, forces!) where T
     #=
@@ -54,6 +78,8 @@ function md_Verlet(x0::Vector{T}, v0::Vector{T}, mass, dt, box_side, nsteps, isa
     a = similar(x0)
     f = similar(x0) # Initialize force vector
     trajectory = [ copy(x0) ] # will store the trajectory
+    sigma_xy_series = Float64[]
+    
     for step in 1:nsteps
         # Compute forces and store in f
         forces!(f,x)
@@ -72,13 +98,16 @@ function md_Verlet(x0::Vector{T}, v0::Vector{T}, mass, dt, box_side, nsteps, isa
         @. a = f / mass
         # Complete velocity update
         @. v = v + 0.5*a*dt
+        # Compute sigma xy
+        sigma_xy = shear_stress_xy(x, v, f, mass, box_side)
         # Save the trajectory at specified intervals
         if mod(step,isave) == 0
-            println("Saved trajectory at step: ",step)
+            println("Saved trajectory at step: ",step, " with sigma_xy: ", sigma_xy)
             push!(trajectory,copy(x))
+            push!(sigma_xy_series, sigma_xy)
         end
     end
-    return trajectory
+    return trajectory, mean(sigma_xy_series[ceil(Int, 0.7*length(sigma_xy_series)):end])
 end
 
 # function that calculates pairwise forces between oil and water particles in an emulsion
@@ -143,27 +172,31 @@ d_values = 0:0.01:1.5*cutoff
 f_oo = [ femulsion_plot(d,cutoff,a_oo) for d in d_values ]
 f_ww = [ femulsion_plot(d,cutoff,a_ww) for d in d_values ]
 f_ow = [ femulsion_plot(d,cutoff,a_ow) for d in d_values ]
-plot(
-    d_values, f_oo,
-    label="Oil-Oil Interaction",
-    xlabel="Distance", ylabel="Force Magnitude",
-    title="Emulsion Interaction Forces",
-    legend=:topright,
-    linewidth=2,
-)
-plot!(
-    d_values, f_ww,
-    label="Water-Water Interaction",
-    linewidth=2,
-)
-plot!(
-    d_values, f_ow,
-    label="Oil-Water Interaction",
-    linewidth=2,
-)
-gif_dir = joinpath(@__DIR__, "gif_chang_MD")
-isdir(gif_dir) || mkpath(gif_dir)
-savefig(joinpath(gif_dir, "emulsion_forces.png"))
+
+if output_plots
+    plot(
+        d_values, f_oo,
+        label="Oil-Oil Interaction",
+        xlabel="Distance", ylabel="Force Magnitude",
+        title="Emulsion Interaction Forces",
+        legend=:topright,
+        linewidth=2,
+    )
+    plot!(
+        d_values, f_ww,
+        label="Water-Water Interaction",
+        linewidth=2,
+    )
+    plot!(
+        d_values, f_ow,
+        label="Oil-Water Interaction",
+        linewidth=2,
+    )
+    gif_dir = joinpath(@__DIR__, "gif_chang_MD")
+    isdir(gif_dir) || mkpath(gif_dir)
+    savefig(joinpath(gif_dir, "emulsion_forces.png"))
+end
+
 
 # Defining simulation parameters for the emulsion MD simulation
 const box_side = 32.2
@@ -328,17 +361,20 @@ for volume_fraction_oil in [0.2, 0.4, 0.6, 0.8, 0.95]
     box_emulsion = Box([box_side,box_side],cutoff)
     cl_emulsion = CellList(x0_emulsion,box_emulsion)
 
-    t_emulsion = @elapsed trajectory_emulsion = md_Verlet((
+    save_every_n_frames = 100
+
+    t_emulsion = @elapsed trajectory_emulsion, sigma_xy = md_Verlet((
         x0 = x0_emulsion, 
         v0 = [random_vec(Vec2D{Float64},(-0.1,0.1)) for _ in 1:n_total ], 
         mass = [ 1.0 for _ in 1:n_total ],
         dt = dt,
         box_side = box_side,
         nsteps = nsteps,
-        isave = nsteps/100,
+        isave = nsteps/save_every_n_frames,
         forces! = (f,x) -> forces_emulsion!(f,x,box_emulsion,box_side,cl_emulsion,n_oil,n_water,f_emulsion_pair!)
     )...)
     println("Time taken for emulsion simulation: ",t_emulsion," seconds")
+    println("Sigma_xy: ", sigma_xy)
 
     # Analyzing emulsion stability 
     println("Number of oil particles at the beginning: ",n_oil,", Number of water particles at the beginning: ",n_water, ", Total particles: ",n_total)
@@ -360,25 +396,27 @@ for volume_fraction_oil in [0.2, 0.4, 0.6, 0.8, 0.95]
     println("Number of water particles out of bounds: ",water_out)
     println("Percent of particles sent to infinity: ", (oil_out + water_out) / n_total * 100, "%")
 
-    # Visualizing the emulsion trajectory
-    anim_emulsion = @animate for frame in trajectory_emulsion
-        scatter(
-            [ p.x for p in frame[1:n_oil] ],
-            [ p.y for p in frame[1:n_oil] ],
-            xlim=(-box_side/2,box_side/2), ylim=(-box_side/2,box_side/2),
-            title="Emulsion MD Simulation",
-            xlabel="X Position", ylabel="Y Position",
-            markersize=2,
-            color=:orange,
-        )
-        scatter!(
-            [ p.x for p in frame[n_oil+1:end] ],
-            [ p.y for p in frame[n_oil+1:end] ],
-            markersize=2,
-            color=:blue,
-        )
+    if output_plots
+        # Visualizing the emulsion trajectory
+        anim_emulsion = @animate for frame in trajectory_emulsion
+            scatter(
+                [ p.x for p in frame[1:n_oil] ],
+                [ p.y for p in frame[1:n_oil] ],
+                xlim=(-box_side/2,box_side/2), ylim=(-box_side/2,box_side/2),
+                title="Emulsion MD Simulation",
+                xlabel="X Position", ylabel="Y Position",
+                markersize=2,
+                color=:orange,
+            )
+            scatter!(
+                [ p.x for p in frame[n_oil+1:end] ],
+                [ p.y for p in frame[n_oil+1:end] ],
+                markersize=2,
+                color=:blue,
+            )
+        end
+        # Save as GIF
+        gif_path = joinpath(gif_dir, "trajectory_emulsion_vf_$(volume_fraction_oil)_$(nsteps)_$(dt).gif")
+        gif(anim_emulsion, gif_path, fps=save_every_n_frames/dt)
     end
-    # Save as GIF
-    gif_path = joinpath(gif_dir, "trajectory_emulsion_vf_$(volume_fraction_oil)_$(nsteps)_$(dt).gif")
-    gif(anim_emulsion, gif_path, fps=20)
 end
