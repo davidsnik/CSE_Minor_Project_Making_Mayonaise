@@ -293,7 +293,7 @@ if output_plots
     )
     gif_dir = joinpath(@__DIR__, "gif_chang_MD")
     isdir(gif_dir) || mkpath(gif_dir)
-    savefig(joinpath(gif_dir, "emulsion_forces.png"))
+    savefig(joinpath(gif_dir, "emulsion_forces_wall.png"))
 end
 
 
@@ -639,8 +639,8 @@ for volume_fraction_oil in [0.2, 0.4, 0.6, 0.8, 0.95]
                 )
             end
     
-            gif_path = joinpath(gif_dir, "trajectory_emulsion_vf_$(volume_fraction_oil)_$(nsteps)_$(dt).gif")
+            gif_path = joinpath(gif_dir, "trajectory_emulsion_vf_$(volume_fraction_oil)_$(nsteps)_$(dt)_wall.gif")
             gif(anim_emulsion, gif_path, fps = isave/dt)
         end
-    end
+    endF
 end
