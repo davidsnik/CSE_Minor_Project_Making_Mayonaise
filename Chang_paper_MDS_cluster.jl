@@ -1,10 +1,9 @@
 using Plots
-using CellListMap # package that divides the domain into cells and only computes interactions between particles in neighboring cells
-import CellListMap: Box, CellList, UpdateCellList!, map_pairwise!
+import CellListMap: Box, CellList, UpdateCellList!, map_pairwise! # package that divides the domain into cells and only computes interactions between particles in neighboring cells
 using StaticArrays
 import LinearAlgebra: norm
-using Statistics
 import Statistics: mean, std
+import Clustering: dbscan
 
 
 # Defnition of a position vector for each particle
@@ -28,8 +27,7 @@ begin
     plot_font = "Computer Modern"
     default(
         fontfamily=plot_font,
-        linewidth=2, framestyle=:box, label=:none, grid=false,
-        size=(400,400)
+        linewidth=2, framestyle=:box, label=:none, grid=false
     )    
 end
 
@@ -110,7 +108,7 @@ function f_emulsion_pair!(i,j,x::T,y::T,cutoff,side,a_ij,f) where T
     in_repulsive = a_ij == a_oo
     if d > cutoff
         fₓ = zero(T)
-    elseif d<1e-12 && in_repulsive
+    elseif d<1e-5 && in_repulsive
         fₓ = 3000*(1-d/cutoff)*(Δv/d)
     else
         fₓ = a_ij*(1-d/cutoff)*(Δv/d)
@@ -125,7 +123,7 @@ function femulsion_plot(d,cutoff,a_ij)
     in_repulsive = a_ij == a_oo
     if d > cutoff
         fₓ = 0
-    elseif d < 1e-12 && in_repulsive
+    elseif d < 1e-5 && in_repulsive
         fₓ = 3000*(1-d/cutoff)
     else
         fₓ = a_ij*(1-d/cutoff)
@@ -146,28 +144,172 @@ isdir(gif_dir) || mkpath(gif_dir)
 # Defining simulation parameters for the emulsion MD simulation (taken from the paper)
 const box_side = 32.2
 const density_number = 3
-const nsteps = 10^4
+const nsteps = 10^6 # change to 10^4
 const dt = 0.01
 const volume_fraction_oil = 0.8
 
+# Place n_droplets centers inside the box, separated by at least ~2R
+function generate_droplet_centers(n_droplets::Int,
+                                  box_side::T,
+                                  R::T;
+                                  margin_factor::T = 1.5) where T
+    
+    centers = Vec2D{T}[]
+    min_dist = 2 * R * margin_factor
+
+    x_min = -box_side/2 + R
+    x_max =  box_side/2 - R
+    y_min = -box_side/2 + R
+    y_max =  box_side/2 - R
+
+    max_attempts = 10000
+    attempt = 0
+    while length(centers) < n_droplets
+        c = Vec2D(
+            x_min + rand(T)*(x_max - x_min),
+            y_min + rand(T)*(y_max - y_min),
+        )
+        if all(norm(c - c_old) > min_dist for c_old in centers)
+            push!(centers, c)
+        end
+
+        attempt += 1
+
+        if attempt == max_attempts
+            attempt = 0
+            n_droplets -= 1
+        end
+    end
+
+    return centers
+end
+
+# Generate oil positions in several identical circular droplets
+function generate_multi_droplet(n_oil::Int,
+                                    centers::Vector{Vec2D{T}},
+                                    droplet_area::T) where T
+    n_droplets = length(centers)
+    R = sqrt(droplet_area / pi)  # radius of each droplet
+
+    oil = Vec2D{T}[]
+
+    # distribute particle counts as evenly as possible
+    base = div(n_oil, n_droplets)
+    extra = rem(n_oil, n_droplets)
+    n_per = [base + (k <= extra ? 1 : 0) for k in 1:n_droplets]
+
+    for (k, center) in enumerate(centers)
+        for i in 1:n_per[k]
+            # uniform sampling in a disk: r = R*sqrt(u), theta in [0,2pi]
+            r = R * sqrt(rand(T))
+            theta = 2 * T(pi) * rand(T)
+            push!(oil, Vec2D(
+                center.x + r * cos(theta),
+                center.y + r * sin(theta),
+            ))
+        end
+    end
+
+    return oil, R
+end
+
+# Generate water particles outside all droplets
+function generate_outside_droplets(n_water::Int,
+                                         centers::Vector{Vec2D{T}},
+                                         R::T,
+                                         box_side::T) where T
+    water = Vec2D{T}[]
+    x_min, x_max = -box_side/2, box_side/2
+    y_min, y_max = -box_side/2, box_side/2
+
+    while length(water) < n_water
+        p = random_vec(Vec2D{T}, (x_min, x_max))
+        # keep p only if it is outside every droplet
+        if all(norm(p - c) > R for c in centers)
+            push!(water, p)
+        end
+    end
+
+    return water
+end
+
 volume_oil = volume_fraction_oil * box_side^2
+volume_water = box_side^2 - volume_oil
 
 n_oil::Int = ceil(volume_oil * density_number)
 n_water::Int = ceil((box_side^2 - volume_oil) * density_number)
 n_total = n_oil + n_water
 
 #initializing positions of oil and water particles randomly within the box
-x0_oil = [ random_vec(Vec2D{Float64},(-box_side/2,box_side/2)) for _ in 1:n_oil ] # size 2xn_oil
-x0_water = [ random_vec(Vec2D{Float64},(-box_side/2,box_side/2)) for _ in 1:n_water ] # size 2xn_water
+n_droplets = 4
+println("Number of oil particles: ",n_oil,", Number of water particles: ",n_water,", Total particles: ",n_total)
+x0_oil, x0_water = if volume_fraction_oil <= 0.5
+    droplet_area = volume_oil / n_droplets          # area of ONE droplet
+    R_droplet    = sqrt(droplet_area / pi)           # same R used for centers
+
+    # pick droplet centers
+    centers = generate_droplet_centers(
+        n_droplets,
+        box_side,
+        R_droplet;
+        margin_factor = 1.5,
+    )
+
+    # generate oil inside droplets
+    x0_oil, R_used = generate_multi_droplet(
+        n_oil,
+        centers,
+        droplet_area,
+    )
+
+    # generate water outside droplets
+    x0_water = generate_outside_droplets(
+        n_water,
+        centers,
+        R_used,
+        box_side,
+    )
+
+    x0_oil, x0_water
+else
+    droplet_area = volume_water / n_droplets          # area of ONE droplet
+    R_droplet    = sqrt(droplet_area / pi)           # same R used for centers
+
+    # pick droplet centers
+    centers = generate_droplet_centers(
+        n_droplets,
+        box_side,
+        R_droplet;
+        margin_factor = 1.5,
+    )
+
+    # generate oil inside droplets
+    x0_water, R_used = generate_multi_droplet(
+        n_water,
+        centers,
+        droplet_area,
+    )
+
+    # generate water outside droplets
+    x0_oil = generate_outside_droplets(
+        n_oil,
+        centers,
+        R_used,
+        box_side,
+    )
+
+    x0_oil, x0_water
+end
+
 x0_emulsion = vcat(x0_oil,x0_water) # size 2x(n_oil+n_water)
 box_emulsion = Box([box_side,box_side],cutoff)
 cl_emulsion = CellList(x0_emulsion,box_emulsion)
-
-
+masses = vcat([ 0.96 for _ in 1:n_oil ], [ 1.0 for _ in 1:n_water ]...) # mass of each particle
+println("Starting emulsion simulation with droplet initialization...")
 t_emulsion = @elapsed trajectory_emulsion = md_Verlet((
     x0 = x0_emulsion, 
     v0 = [random_vec(Vec2D{Float64},(-0.1,0.1)) for _ in 1:n_total ], 
-    mass = [ 1.0 for _ in 1:n_total ],
+    mass = masses,
     dt = dt,
     box_side = box_side,
     nsteps = nsteps,
@@ -196,7 +338,7 @@ println("Number of oil particles out of bounds: ",oil_out)
 println("Number of water particles out of bounds: ",water_out)
 println("Percent of particles sent to infinity: ", (oil_out + water_out) / n_total * 100, "%")
 
-#= Uncomment if needed but the specific code for that is in the "Chang_paper_MDS.jl" 
+# Uncomment if needed but the specific code for that is in the "Chang_paper_MDS.jl" 
 
 # Visualizing the emulsion trajectory
 anim_emulsion = @animate for frame in trajectory_emulsion
@@ -217,18 +359,19 @@ anim_emulsion = @animate for frame in trajectory_emulsion
     )
 end
 # Save as GIF
-gif_path = joinpath(gif_dir, "trajectory_emulsion_vf_$(volume_fraction_oil)_$(nsteps)_$(dt).gif")
+gif_path = joinpath(gif_dir, "trajectory_emulsion_vf_$(volume_fraction_oil)_$(nsteps)_$(dt)_masses.gif")
 gif(anim_emulsion, gif_path, fps=20)
-=#
+
 
 
 # for every time frame, assign a cluster ID to every water particle based on proximity
-using Clustering
 clustered_frames = [] # final size of this will be n_particlesxn_frames (idx for every particle at every frame)
 for (frame_index, frame) in enumerate(trajectory_emulsion)
     
     water_positions = frame[n_oil+1:end]
-    water_coords = hcat([ [p.x, p.y] for p in water_positions ]) # convert to Nx2 matrix
+    water_coords = hcat(([Float64(p.x), Float64(p.y)] for p in water_positions)...)  # size (2, N)
+
+    #water_coords = hcat([ Float64[p.x, p.y] for p in water_positions ]) # convert to Nx2 matrix
     # Perform DBSCAN clustering
     clustering_result = dbscan(water_coords, 1.5, min_neighbors=3)
     push!(clustered_frames, clustering_result.assignments)
@@ -238,9 +381,11 @@ end
 # make a random choice of np water particles and track their cluster ID over time
 num_rnd_p = 5
 idx = rand(1:n_water, num_rnd_p)
+#=
 # Plot cluster ID assigned to each particle over time
 using StatsPlots
 cluster_plot = @animate for (frame_idx, assignments) in enumerate(clustered_frames)
+    @show eltype(assignments) size(assignments[1]) assignments frame_idx
     scatter(
         1:num_rnd_p,
         assignments[idx], # chose random 20 water particles for clarity
@@ -251,8 +396,8 @@ cluster_plot = @animate for (frame_idx, assignments) in enumerate(clustered_fram
         markersize=3,
     )
 end
-gif(cluster_plot, joinpath(gif_dir, "water_particle_clustering.gif"), fps=1)
-
+gif(cluster_plot, joinpath(gif_dir, "water_particle_clustering_droplet_init.gif"), fps=1)
+=#
 # Bar plot of cluster sizes over time
 cluster_sizes = @animate for (frame_idx, assignments) in enumerate(clustered_frames)
     # Compute sizes per cluster (DBSCAN uses 0 for noise)
@@ -268,9 +413,9 @@ cluster_sizes = @animate for (frame_idx, assignments) in enumerate(clustered_fra
         legend = false,
     )
 end
-gif(cluster_sizes, joinpath(gif_dir, "cluster_sizes.gif"), fps=1)
+gif(cluster_sizes, joinpath(gif_dir, "cluster_sizes_droplet_init_masses.gif"), fps=1)
 
-
+#=
 # plot cluster id over time for 5 particles (every particle different color)
 num_rnd_p = 100
 idx = rand(1:n_water, num_rnd_p)
@@ -310,11 +455,11 @@ p2 = plot(
     label_p2 = permutedims(string.("particle ", idx))  # optional labels
 )
 plot(p1, p2, layout=(2,1))
-savefig(joinpath(gif_dir, "water_particle_mean_positions_over_time.png"))
-
+savefig(joinpath(gif_dir, "water_particle_mean_positions_over_time_droplet_init.png"))
+=#
 # animate tajectory of particles starting in one (given) cluster
 # cluster_ids = [1,4,8,12,15,18,20] 
-cluster_ids = [8] 
+cluster_ids = [4] 
 for cluster_id in cluster_ids
     println("Animating trajectory for cluster ID: ", cluster_id)
     idx_in_cluster = findall(==(cluster_id), clustered_frames[1]) # indices of water particles in the chosen cluster at first frame
@@ -333,7 +478,7 @@ for cluster_id in cluster_ids
             color=:blue,
         )
     end
-    gif(anim_cluster, joinpath(gif_dir, "cluster_$(cluster_id)_trajectory.gif"), fps=3)
+    gif(anim_cluster, joinpath(gif_dir, "cluster_$(cluster_id)_trajectory_droplet_init_masses.gif"), fps=3)
 end
 
 # make a gif of a trajectory of water droplets with each cluster colored on different color
@@ -360,5 +505,5 @@ anim_emulsion = @animate for (frame_idx, frame) in enumerate(trajectory_emulsion
 end
 
 # Save as GIF
-gif_path = joinpath(gif_dir, "trajectory_emulsion_clusters_vf_$(volume_fraction_oil)_$(nsteps)_$(dt).gif")
+gif_path = joinpath(gif_dir, "trajectory_emulsion_clusters_vf_$(volume_fraction_oil)_$(nsteps)_$(dt)_droplet_init_masses.gif")
 gif(anim_emulsion, gif_path, fps=5)
