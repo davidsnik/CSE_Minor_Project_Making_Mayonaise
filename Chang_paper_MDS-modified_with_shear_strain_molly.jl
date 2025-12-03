@@ -3,6 +3,7 @@ import CellListMap: Box, CellList, UpdateCellList!, map_pairwise!
 using StaticArrays
 import LinearAlgebra: norm
 using Statistics: mean
+using molly
 
 output_plots = true
 
@@ -347,7 +348,7 @@ function generate_multi_droplet(n_oil::Int,
     n_droplets = length(centers)
     R = sqrt(droplet_area / pi)  # radius of each droplet
 
-    oil = Vec2D{T}[]
+    oil = SVector{2,T}[]
 
     # distribute particle counts as evenly as possible
     base = div(n_oil, n_droplets)
@@ -359,7 +360,7 @@ function generate_multi_droplet(n_oil::Int,
             # uniform sampling in a disk: r = R*sqrt(u), theta in [0,2pi]
             r = R * sqrt(rand(T))
             theta = 2 * T(pi) * rand(T)
-            push!(oil, Vec2D(
+            push!(oil, SVector{2,T}(
                 center.x + r * cos(theta),
                 center.y + r * sin(theta),
             ))
@@ -376,7 +377,7 @@ function generate_outside_droplets(n_water::Int,
                                    box_side::T,
                                    walls::Vector{Vec2D{T}} = Vec2D{T}[];
                                    wall_buffer::T = 0.5*cutoff) where T
-    water = Vec2D{T}[]
+    water = SVector{2,T}[]
     x_min, x_max = -box_side/2, box_side/2
     # keep away from walls in y by a small buffer as well
     y_min, y_max = -box_side/2 + wall_buffer, box_side/2 - wall_buffer
@@ -392,7 +393,7 @@ function generate_outside_droplets(n_water::Int,
         px = x_min + rand(T)*(x_max - x_min)
         # sample y in interior
         py = y_min + rand(T)*(y_max - y_min)
-        p = Vec2D(px, py)
+        p = SVector{2,T}(px, py)
 
         # outside every droplet?
         inside_any_droplet = any(norm(p - c) <= R for c in centers)
@@ -428,7 +429,7 @@ end
 
 
 function make_rough_wall_particles(
-        VecType::Type{Vec2D{T}},
+        VecType::Type{SVector{2,T}},
         box_side::T,
         n_per_wall::Int;
         y_offset::T = 0.0,
@@ -541,7 +542,8 @@ for volume_fraction_oil in [0.2, 0.4, 0.6, 0.8, 0.95]
         x0_emulsion = vcat(x0_oil, x0_water)
         x0_all      = vcat(x0_emulsion, walls)
     
-        box_emulsion = Box([box_side, box_side], cutoff)
+        boundary = molly.RectangularBoundary(box_side)
+        
         cl_emulsion  = CellList(x0_all, box_emulsion)
     
         n_bulk   = length(x0_emulsion)   # = n_oil + n_water
@@ -556,13 +558,24 @@ for volume_fraction_oil in [0.2, 0.4, 0.6, 0.8, 0.95]
         botwall_ids = (n_bulk+n_topwall+1):(n_total)
     
         isave = 100
-    
-        v0_all = [random_vec(Vec2D{Float64},(-0.1,0.1)) for _ in 1:n_bulk]
-        append!(v0_all, [Vec2D(0.0, 0.0) for _ in 1:(n_topwall+n_botwall)])
+        temp = 293.15u"K"   # room temperature in Kelvin
+        beads = [molly.Atom(mass = 1) for _ in 1:n_total]
+        v0_all = [random_velocity(1, temp) for _ in 1:n_bulk]
+        append!(v0_all, [SVector{2,Float64}(0.0, 0.0) for _ in 1:(n_topwall+n_botwall)])
     
         mass_all = [1.0 for _ in 1:n_total]
         U_wall   = wall_velocity_from_shear(applied_shear, nsteps, dt, box_side)
-    
+        pairwise_force = f_emulsion_pair_shear!
+
+        sys = molly.System(
+            atoms=beads,
+            coords=x0_all,,
+            boundary=boundary,,
+            velocities=v0_all,
+            pairwise_inters=(pairwise_force,),
+            logger=(coords=CoordinatesLogger(1000),),
+        )
+
         t_emulsion = @elapsed trajectory_emulsion, sigma_xy = md_Verlet_walls(
             x0_all, v0_all, mass_all,
             dt, box_side, nsteps, isave,
