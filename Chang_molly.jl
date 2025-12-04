@@ -129,9 +129,9 @@ function build_emulsion_system(x0_all::Vector{SVector{2,Float64}},
     return sys
 end
 # defining repulsion parameters, much more stable behaviour with bigger a_oil_water and smaller a_water_water/a_oil_oil
-const a_water_water = 5.0 # 5 <- better
-const a_oil_oil     = 5.0 # 5 <- better
-const a_oil_water   = 100.0 # 100 <- better
+const a_water_water = 25.0 # 5 <- better
+const a_oil_oil     = 25.0 # 5 <- better
+const a_oil_water   = 80.0 # 100 <- better
 
 const a_wall_wall   = 25.0
 const a_wall_water  = 25.0
