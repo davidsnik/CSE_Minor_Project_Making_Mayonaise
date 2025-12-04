@@ -1,10 +1,8 @@
 using StaticArrays
-using Molly
-using Molly: PairwiseInteraction, simulate!, Verlet, random_velocity
-using Molly: visualize
-using Unitful
+import CellListMap: Box, CellList, UpdateCellList!, map_pairwise!
 using LinearAlgebra: norm
 using GLMakie  # Make sure you have this loaded
+using Plots: scatter, scatter!, @animate, gif
 
 function wrap_x(x::T, box_side::T) where T
     half_box = box_side / 2
@@ -17,130 +15,191 @@ function wrap_x(x::T, box_side::T) where T
     end
 end
 
+function f_emulsion_pair_shear!(i, j,
+                                x::T, y::T,
+                                cutoff, side, a_ij,
+                                f) where T
+
+    Δ = y - x                  # works for SVector and Vec2D
+    Δx = wrap_x(Δ[1], side)    # minimum image only in x
+    Δy = wrap_x(Δ[2], side)    # minimum image only in y
+
+    # construct displacement with the SAME type as x,y (T can be Vec2D or SVector)
+    Δv = T(Δx, Δy)
+
+    d = norm(Δv)
+    in_repulsive = a_ij == a_oil_oil
+
+    if d > cutoff
+        fₓ = zero(T)
+    elseif d < 1e-12 && in_repulsive
+        fₓ = 3000 * (1 - d/cutoff) * (Δv / d)
+    else
+        fₓ = a_ij * (1 - d/cutoff) * (Δv / d)
+    end
+
+    f[i] += fₓ
+    
+    return f
+end
+# Defnition of a position vector for each particle
+struct Vec2D{T} <: FieldVector{2,T} # A 2D vector with components of type T
+    x::T
+    y::T
+end
+
+
+
+# Initialize default plot settings
+begin
+    using Plots
+    plot_font = "Computer Modern"
+    default(
+        fontfamily=plot_font,
+        linewidth=2, framestyle=:box, label=:none, grid=false,
+        size=(400,400)
+    )    
+end
+
+
+function md_Verlet_walls(x0::Vector{T}, v0::Vector{T}, mass,
+                         dt, box_side, cutoff, nsteps, isave, 
+                         bulk_ids) where T
+
+    # Copy initial state
+    x = copy(x0)
+    v = copy(v0)
+    f = similar(x0)
+
+    for i in bulk_ids
+        for j in bulk_ids
+            if i!= j
+                if i < 3 && j<3
+                    a_ij = a_oil_oil
+                elseif i >=3 && j>=3
+                    a_ij = a_water_water
+                else
+                    a_ij = a_oil_water
+                end
+                # compute forces between bulk particles
+                f_emulsion_pair_shear!(i, j, x[i], x[j], cutoff, box_side, a_ij, f)
+            end
+        end
+    end
+
+    trajectory       = Vector{Vector{T}}(undef, 0)
+
+
+    push!(trajectory, copy(x))
+
+    # Main loop
+    for step in 1:nsteps
+        # --- half-step velocity update (bulk only) ---
+        @inbounds for i in bulk_ids
+            v[i] += 0.5 * (f[i] / mass[i]) * dt
+        end
+
+        # --- full position update for bulk ---
+        @inbounds for i in bulk_ids
+            x[i] += v[i] * dt
+            x[i] = Vec2D(wrap_x(x[i].x, box_side), wrap_x(x[i].y, box_side))
+        end
+
+
+
+        # --- compute new forces at updated positions ---
+        for i in bulk_ids
+            for j in bulk_ids
+                if i!= j
+                    if i < 3 && j<3
+                        a_ij = a_oil_oil
+                    elseif i >=3 && j>=3
+                        a_ij = a_water_water
+                    else
+                        a_ij = a_oil_water
+                    end
+                    # compute forces between bulk particles
+                    f_emulsion_pair_shear!(i, j, x[i], x[j], cutoff, box_side, a_ij, f)
+                end
+            end
+        end
+        
+
+        # --- second half-step velocity update (bulk only) ---
+        @inbounds for i in bulk_ids
+            v[i] += 0.5 * (f[i] / mass[i]) * dt
+        end
+
+        
+        if step % isave == 0
+            push!(trajectory, copy(x))
+           
+        end
+    end
+
+
+    return trajectory
+end
+
+
+
 const a_water_water = 25.0
 const a_oil_oil     = 25.0
 const a_oil_water   = 80.0
 
-# Map bead types to interaction strengths
-const A_MAP = Dict{Tuple{Int,Int},Float64}(
-    (1,1)     => a_oil_oil,
-    (2,2) => a_water_water,
-    (1,2)   => a_oil_water,
-    (2,1)   => a_oil_water,
-)
+tiny_box_side = 1.0
+tiny_cutoff   = 3.0
+n_oil = 2
+n_water = 0
+n_total = n_oil + n_water
+x0_oil = [Vec2D(-0.1, -0.1), Vec2D(0.1, 0.1)]
+x0_water = [Vec2D(-0.1, 0.1), Vec2D(0.1, -0.1)]
+        
+x0_emulsion = vcat(x0_oil, x0_water)
+        
+    
 
-# Custom pairwise interaction with cutoff
-struct EmulsionInter{T} <: PairwiseInteraction
-    cutoff::T
-end
-Molly.use_neighbors(::EmulsionInter) = true
-
-# Pairwise scalar force law (depends only on distance)
-function Molly.pairwise_force(inter::EmulsionInter, r, params)
-    a_ij, repulsive = params
-    if r > inter.cutoff
-        return 0.0
-    elseif repulsive && r < 1e-12
-        return 3000 * (1 - r/inter.cutoff)
-    else
-        return a_ij * (1 - r/inter.cutoff)
-    end
-end
-
-# Vector force along minimum-image displacement (x periodic only)
-function Molly.force(inter::EmulsionInter,
-                     vec_ij,
-                     atom_i::Molly.Atom,
-                     atom_j::Molly.Atom,
-                     force_units,
-                     special,
-                     coord_i,
-                     coord_j,
-                     boundary::Molly.RectangularBoundary,
-                     velocity_i,
-                     velocity_j,
-                     step_n)
-
-    # vec_ij is displacement; enforce x-periodic, y direct
-    Δx = wrap_x(vec_ij[1], boundary.side_lengths[1])  # periodic in x
-    Δy = vec_ij[2]                                # non-periodic in y
-    disp = SVector(Δx, Δy)
-    r = norm(disp)
-    # Choose a_ij from atom "type" (stored in atom metadata)
-    ti = atom_i.atom_type  # e.g., Oil/Water/Wall
-    tj = atom_j.atom_type
-    a_ij = get(A_MAP, (ti, tj), 0.0)
-    repulsive = a_ij == a_oil_oil
-    params = (a_ij, repulsive)
-
-    fmag = Molly.pairwise_force(inter, r, params)
-    return r > 0 ? fmag * disp / r : SVector(0.0, 0.0)
-end
-
-function MyCoordinatesLogger(T, n_steps::Integer; dims::Integer=3)
-    return Molly.GeneralObservableLogger(
-        Molly.coordinates_wrapper,
-        Array{SArray{Tuple{dims}, T, 1, dims}, 1},
-        n_steps,
-    )
-end
-
-MyCoordinatesLogger(n_steps::Integer; dims::Integer=3) = MyCoordinatesLogger(Float64, n_steps; dims=dims)
-
-
-
-atoms_tiny = [Molly.Atom(mass=1.0, atom_type=1), Molly.Atom(mass=1.0, atom_type=1),
-              Molly.Atom(mass=1.0, atom_type=2), Molly.Atom(mass=1.0, atom_type=2),
-]    
-cutoff_tiny = 3.0
-temp_val = 1
-p = 0.1
-position_tiny = SVector{2,Float64}[
-    SVector{2,Float64}(-p, -p),
-    SVector{2,Float64}(p, p),
-    SVector{2,Float64}(-p, p),
-    SVector{2,Float64}(p, -p),
-]
-
-vel_tiny = zeros(SVector{2,Float64}, 4)
-boundary_tiny = Molly.RectangularBoundary(1.0)
-neighbor_finder_tiny = Molly.DistanceNeighborFinder(
-    eligible=trues(4, 4),
-    n_steps=10,
-    dist_cutoff=cutoff_tiny,
-)
-
-sys = Molly.System(
-    atoms = atoms_tiny,
-    coords = position_tiny,
-    boundary = boundary_tiny,
-    velocities = vel_tiny,
-    pairwise_inters = (MyPairwiseInter=EmulsionInter(cutoff_tiny),),
-    neighbor_finder = neighbor_finder_tiny,
-    loggers = (coords=MyCoordinatesLogger(1,dims=2),),
-    energy_units = Unitful.NoUnits,
-    force_units = Unitful.NoUnits,
-    k = 1.0/temp_val,
-)
-
+isave = 1
+v0_all = [Vec2D(0.0, 0.0) for _ in 1:n_total]
+bulk_ids    = 1:(n_oil + n_water)
 dt = 0.001
-n_steps = 1000
-verlet = Verlet(dt=dt)
-simulate!(sys, verlet, n_steps);
-how_many = length(atoms_tiny)
-colors_tiny = [if i <= how_many/2
-            :yellow
-        elseif i <= how_many
-            :blue
-        else
-            :gray
-        end for i in 1:how_many]
-
-visualize(
-    sys.loggers.coords.history,
-    sys.boundary,
-    "emulsion_molly_tiny_positive_velocity_verlet_dt_$dt.mp4";
-    color = [:yellow, :orange, :blue, :gray],
-    markersize = 0.05,
-    framerate = 10,
+nsteps = 1000
+        
+mass_all = [1.0 for _ in 1:n_total]
+        
+t_emulsion = @elapsed trajectory_emulsion = md_Verlet_walls(
+    x0_emulsion, v0_all, mass_all,
+    dt, tiny_box_side, tiny_cutoff, nsteps, isave, bulk_ids
 )
+
+println("Time taken for emulsion simulation: ",t_emulsion," seconds")
+     
+        
+anim_emulsion = @animate for frame in trajectory_emulsion
+        # Oil particles
+        scatter(
+            [p.x for p in frame[1:n_oil]],
+            [p.y for p in frame[1:n_oil]],
+            xlim = (-tiny_box_side/2, tiny_box_side/2),
+            ylim = (-tiny_box_side/2, tiny_box_side/2),
+            title = "4 particles MD Simulation",
+            xlabel = "X Position",
+            ylabel = "Y Position",
+            markersize = 2,
+            color = [:orange, :blue],
+        )
+
+        # Water particles
+        scatter!(
+            [p.x for p in frame[n_oil+1 : n_oil+n_water]],
+            [p.y for p in frame[n_oil+1 : n_oil+n_water]],
+            markersize = 2,
+            color = :blue,
+        )
+    
+    end
+    
+gif(anim_emulsion, "emulsion_tiny_positive_velocity_verlet_dt_$dt.mp4", fps = 10)
+        
+
+
