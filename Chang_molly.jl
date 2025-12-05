@@ -343,7 +343,10 @@ nsteps = Int(round(T/dt))
 
 # Time-dependent shear strain gamma(t). Supply any lambda you like here; gammȧ(t)
 # is approximated numerically inside make_shear_profile.
-gamma_fn = t -> 0.5 * t / T              # linear ramp to gamma=0.5 at t=T
+shear_freq = 0.5            # cycles per unit time; adjust as needed
+gamma_amplitude = 0.5       # peak strain
+gamma_phase = 0.0
+gamma_fn = t -> gamma_amplitude * sin(2*pi*shear_freq*t + gamma_phase)
 shear_profile = make_shear_profile(gamma_fn = gamma_fn)
 
 # Desired output fps; we will subsample to approximate this while keeping duration = T
