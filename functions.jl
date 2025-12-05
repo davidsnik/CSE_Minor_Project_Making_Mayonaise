@@ -168,13 +168,13 @@ function wall_velocity_from_shear(applied_shear, nsteps, dt, box_side; cutoff_lo
     T = nsteps * dt                  # total simulation time
     return applied_shear * H / T
 end
-function wrap_x(x::T, box_side::T) where T
-    half_box = box_side / 2
-    if x > half_box
-        return x - box_side
-    elseif x < -half_box
-        return x + box_side
-    else
-        return x
+# Periodic only in x (no wrapping in y)
+@inline function wrap_x(dx::T, side::T) where T
+    dx = rem(dx, side)
+    if dx >= side/2
+        dx -= side
+    elseif dx < -side/2
+        dx += side
     end
+    return dx
 end

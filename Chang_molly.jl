@@ -52,8 +52,13 @@ function Molly.force(inter::EmulsionInter,
                      velocity_j,
                      step_n)
 
-    r = norm(vec_ij) # wraping is handled by Molly simulator, so not needed here
+    r = norm(vec_ij) # wrapping is handled by Molly simulator, so not needed here
     disp = vec_ij
+    # Guard against r = 0 to avoid division by zero
+    if r <= eps(eltype(disp))
+        return zero(disp)
+    end
+
     # Choose indexes corresponding to atom types 1-> oil, 2-> water 3-> wall
     ti = atom_i.atom_type  
     tj = atom_j.atom_type
@@ -76,9 +81,25 @@ function MyCoordinatesLogger(T, n_steps::Integer; dims::Integer=3)
 end
 MyCoordinatesLogger(n_steps::Integer; dims::Integer=3) = MyCoordinatesLogger(Float64, n_steps; dims=dims)
 
+# Fallback manual trajectory collector with subsampling by save_every
+# Saves the initial frame, then every save_every steps, and always the final frame.
+function run_and_collect!(sys::Molly.System, simulator, nsteps::Integer; save_every::Integer=1)
+    save_every = max(1, save_every)
+    hist = Vector{Vector{SVector{2,Float64}}}()
+    push!(hist, copy(sys.coords))
+    for s in 1:nsteps
+        simulate!(sys, simulator, 1)
+        if s % save_every == 0 || s == nsteps
+            push!(hist, copy(sys.coords))
+        end
+    end
+    return hist
+end
+
 function build_emulsion_system(x0_all::Vector{SVector{2,Float64}},
                                n_oil::Int, n_water::Int,
-                               box_side::Float64, cutoff::Float64, velocities)
+                               box_side::Float64, cutoff::Float64, velocities,
+                               nsteps::Integer)
 
 # The commented out function below is an earlier version of build_emulsion_system with the walls - maybe useful, if not needed, can be deleted.
 # Build system: assign atom types so EmulsionInter can choose a_ij
@@ -105,24 +126,27 @@ function build_emulsion_system(x0_all::Vector{SVector{2,Float64}},
     # end
     
     # Define neighbor finder using CellListMap (exactly the same as in our previous code)
+    # determine how many bulk particles we have locally
+    n_bulk_local = n_oil + n_water
+
     cellListMap_finder = Molly.CellListMapNeighborFinder(
-        eligible=trues(n_bulk, n_bulk), # all bulk particles interact
+        eligible=trues(n_bulk_local, n_bulk_local), # all bulk particles interact
         dist_cutoff=cutoff,
-        x0=x0_all[1:n_bulk],
+        x0=x0_all[1:n_bulk_local],
         unit_cell = boundary,
-        n_steps = 1, # update neighbor list every step
+        n_steps = 10, # update neighbor list every 10 steps for efficiency
         dims = 2,
     )
     
     # Build Molly system that will be solved by a simulator
     sys = Molly.System(
         atoms = atoms,
-        coords = x0_all[1:n_bulk],
+        coords = x0_all[1:n_bulk_local],
         boundary = boundary,
         velocities = velocities,
         pairwise_inters = (MyPairwiseInter=EmulsionInter(cutoff),),
         neighbor_finder = cellListMap_finder,
-        loggers = (coords=MyCoordinatesLogger(1,dims=2),),
+        loggers = (coords=MyCoordinatesLogger(nsteps, dims=2),),
         energy_units = Unitful.NoUnits,
         force_units = Unitful.NoUnits
     )
@@ -242,17 +266,30 @@ v0_all = [random_vec(SVector{2,Float64},(-0.1,0.1)) for _ in 1:n_bulk]
 #v0_all = [SVector{2,Float64}(random_velocity(1.0, temp_val; dims=2)...) for _ in 1:n_bulk]
 #append!(v0_all, [SVector{2,Float64}(0.0, 0.0) for _ in 1:(n_topwall+n_botwall)])
 
-
-sys = build_emulsion_system(x0_all, n_oil, n_water, box_side, cutoff, v0_all)
-
 dt = 0.001
 T = 100
 nsteps = Int(T/dt)
+
+# Desired output fps; we will subsample to approximate this while keeping duration = T
+desired_fps = 60
+
+# Compute save_every from desired_fps; if not enough steps to reach target fps, save every frame
+# frames_target = desired_fps * T; save_every ≈ nsteps / frames_target
+frames_target = max(1, Int(round(desired_fps * T)))
+save_every = max(1, Int(floor(nsteps / frames_target)))
+if save_every <= 0
+    save_every = 1
+end
+
+sys = build_emulsion_system(x0_all, n_oil, n_water, box_side, cutoff, v0_all, nsteps)
+
 simulator = VelocityVerlet(
     dt = dt
 )
 
-sim_time = @elapsed simulate!(sys, simulator, nsteps)
+sim_time = @elapsed begin
+    coords_history = run_and_collect!(sys, simulator, nsteps; save_every=save_every)
+end
 println("Simulation completed in $sim_time seconds.")
 colors = [if i <= n_oil
             :yellow
@@ -262,13 +299,19 @@ colors = [if i <= n_oil
             :gray
         end for i in 1:length(x0_all)]
 
-coords_history = sys.loggers.coords.history
+# Compute framerate so that video duration equals T seconds
+frames = length(coords_history)
+fps = max(1, Int(round(frames / T)))
+
+# Report effective fps and subsampling for traceability
+println("Desired fps: ", desired_fps, ", save_every: ", save_every, ", frames saved: ", frames, ", effective fps: ", fps)
+
 # Ensure output dir exists
 outdir = joinpath(@__DIR__, "Molly_mp4")
 isdir(outdir) || mkpath(outdir) # Create directory if it doesn't exist
 
 # Build filename
-fname = "emulsion_molly_positive_velocity_verlet_$(dt)_$(a_oil_water)_$(a_water_water).mp4"
+fname = "emulsion_molly_positive_velocity_verlet_dt$(dt)_aw$(a_oil_water)_ww$(a_water_water)_target$(desired_fps)_eff$(fps)_se$(save_every).mp4"
 outfile = joinpath(outdir, fname)
 
 visualize(
@@ -277,6 +320,6 @@ visualize(
     outfile;
     color = colors,
     markersize = 0.8,
-    framerate = Int(nsteps/50), # so the simulation will last approx 50 seconds
+    framerate = fps, # set so that duration ≈ T seconds
 )
 
