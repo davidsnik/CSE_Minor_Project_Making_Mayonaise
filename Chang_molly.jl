@@ -5,6 +5,15 @@ using GLMakie  # Make sure you have this loaded
 using Molly: PairwiseInteraction, simulate!, Verlet, random_velocity, visualize
 using Unitful
 using LinearAlgebra: norm
+# Optional progress bars
+const HAS_PROGRESSMETER = Ref(false)
+try
+    @eval import ProgressMeter
+    HAS_PROGRESSMETER[] = true
+catch
+    @warn "ProgressMeter.jl not available; progress bars will be disabled."
+end
+
 include(joinpath(@__DIR__, "functions.jl"))
 # Functions are now available: generate_droplet_centers, generate_oil_particles_in_droplets,
 # generate_water_particles, make_rough_wall_particles
@@ -87,10 +96,20 @@ function run_and_collect!(sys::Molly.System, simulator, nsteps::Integer; save_ev
     save_every = max(1, save_every)
     hist = Vector{Vector{SVector{2,Float64}}}()
     push!(hist, copy(sys.coords))
+
+    # Progress bar for simulation
+    local p = nothing
+    if HAS_PROGRESSMETER[]
+        p = ProgressMeter.Progress(nsteps; desc="Simulating", dt=0.2)
+    end
+
     for s in 1:nsteps
         simulate!(sys, simulator, 1)
         if s % save_every == 0 || s == nsteps
             push!(hist, copy(sys.coords))
+        end
+        if p !== nothing
+            ProgressMeter.next!(p)
         end
     end
     return hist
@@ -267,7 +286,7 @@ v0_all = [random_vec(SVector{2,Float64},(-0.1,0.1)) for _ in 1:n_bulk]
 #append!(v0_all, [SVector{2,Float64}(0.0, 0.0) for _ in 1:(n_topwall+n_botwall)])
 
 dt = 0.001
-T = 100
+T = 10
 nsteps = Int(T/dt)
 
 # Desired output fps; we will subsample to approximate this while keeping duration = T
@@ -314,12 +333,52 @@ isdir(outdir) || mkpath(outdir) # Create directory if it doesn't exist
 fname = "emulsion_molly_positive_velocity_verlet_dt$(dt)_aw$(a_oil_water)_ww$(a_water_water)_target$(desired_fps)_eff$(fps)_se$(save_every).mp4"
 outfile = joinpath(outdir, fname)
 
-visualize(
+# Custom renderer with progress bar for video writing
+function visualize_with_progress(
+    coords_history,
+    boundary::Molly.RectangularBoundary,
+    outfile;
+    color,
+    markersize::Real=0.8,
+    framerate::Integer=30,
+)
+    frames = length(coords_history)
+    side = boundary.side_lengths[1]
+
+    fig = GLMakie.Figure(size=(800,800))
+    ax = GLMakie.Axis(fig[1,1]; limits = (-side/2, side/2, -side/2, side/2), aspect = GLMakie.DataAspect())
+
+    N = length(coords_history[1])
+    xs = GLMakie.Observable([coords_history[1][i][1] for i in 1:N])
+    ys = GLMakie.Observable([coords_history[1][i][2] for i in 1:N])
+
+    GLMakie.scatter!(ax, xs, ys; color=color, markersize=markersize)
+
+    # Progress for rendering
+    local p = nothing
+    if HAS_PROGRESSMETER[]
+        p = ProgressMeter.Progress(frames; desc="Rendering", dt=0.2)
+    end
+
+    GLMakie.record(fig, outfile, 1:frames; framerate=framerate) do i
+        ci = coords_history[i]
+        @inbounds for k in 1:N
+            xs[][k] = ci[k][1]
+            ys[][k] = ci[k][2]
+        end
+        GLMakie.notify(xs); GLMakie.notify(ys)
+        if p !== nothing
+            ProgressMeter.next!(p)
+        end
+    end
+end
+
+visualize_with_progress(
     coords_history,
     sys.boundary,
     outfile;
     color = colors,
     markersize = 0.8,
-    framerate = fps, # set so that duration ≈ T seconds
+    framerate = fps,
 )
 
