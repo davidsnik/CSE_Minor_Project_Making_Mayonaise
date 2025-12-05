@@ -7,10 +7,10 @@ function generate_droplet_centers(n_droplets::Int,
     centers = SVector{2,T}[]
     min_dist = 2 * R * margin_factor
 
-    x_min = -box_side/2 + R
-    x_max =  box_side/2 - R
-    y_min = -box_side/2 + (R + cutoff)
-    y_max =  box_side/2 - (R + cutoff)
+    x_min = R
+    x_max = box_side - R
+    y_min = R + cutoff
+    y_max = box_side - (R + cutoff)
 
     max_attempts = 10000
     attempt = 0
@@ -77,9 +77,9 @@ function generate_outside_droplets(n_water::Int,
     wall_buffer = 2cutoff
     interface_buffer = 0.5cutoff
     water = SVector{2,T}[]
-    x_min, x_max = -box_side/2, box_side/2
+    x_min, x_max = zero(T), box_side
     # keep away from walls in y by a small buffer as well
-    y_min, y_max = -box_side/2 + wall_buffer, box_side/2 - wall_buffer
+    y_min, y_max = wall_buffer, box_side - wall_buffer
     wall_buffer2 = wall_buffer^2
 
     max_attempts = 2_000_000
@@ -136,7 +136,7 @@ function make_rough_wall_particles(
     ) where T
 
     dx = box_side / n_per_wall
-    x_start = -box_side/2 + dx/2
+    x_start = dx/2
 
     x_top_vec = VecType[]
     x_bot_vec = VecType[]
@@ -147,15 +147,15 @@ function make_rough_wall_particles(
     for k in 0:(n_per_wall-1)
         xk = x_start + k*dx
 
-        # Top wall: random x and y slightly below +box_side/2
+        # Top wall: random x and y slightly below box_side
         x_top_pos = xk + (2*rand(T) - one(T)) * jitter_amp
         x_top_pos = wrap_x(x_top_pos, box_side)
-        y_top_pos = box_side/2 - y_offset - rand(T)*y_amp
+        y_top_pos = box_side - y_offset - rand(T)*y_amp
 
-        # Bottom wall: random x and y slightly above -box_side/2
+        # Bottom wall: random x and y slightly above 0
         x_bot_pos = xk + (2*rand(T) - one(T)) * jitter_amp
         x_bot_pos = wrap_x(x_bot_pos, box_side)
-        y_bot_pos = -box_side/2 + y_offset + rand(T)*y_amp
+        y_bot_pos = y_offset + rand(T)*y_amp
 
         push!(x_top_vec, VecType(x_top_pos, y_top_pos))
         push!(x_bot_vec, VecType(x_bot_pos, y_bot_pos))

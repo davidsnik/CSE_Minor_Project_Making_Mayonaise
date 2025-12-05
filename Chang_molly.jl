@@ -32,7 +32,7 @@ end
 struct EmulsionInter{T} <: PairwiseInteraction
     cutoff::T
 end
-Molly.use_neighbors(::EmulsionInter) = true # this specifies if simulation is computing forces between every pair (false) or only neighbors (true)
+Molly.use_neighbors(::EmulsionInter) = true # use neighbor lists; x-wrapping handled in force
 
 # Pairwise scalar force law (depends only on scalar distance between particles "r")
 function Molly.pairwise_force(inter::EmulsionInter, r, params)
@@ -61,8 +61,11 @@ function Molly.force(inter::EmulsionInter,
                      velocity_j,
                      step_n)
 
-    r = norm(vec_ij) # wrapping is handled by Molly simulator, so not needed here
-    disp = vec_ij
+    # Recompute displacement to wrap only in x; do not wrap in y to avoid asymmetric image artifacts.
+    dx = wrap_x(coord_j[1] - coord_i[1], boundary.side_lengths[1])
+    dy = coord_j[2] - coord_i[2]
+    disp = SVector(dx, dy)
+    r = norm(disp)
     # Guard against r = 0 to avoid division by zero
     if r <= eps(eltype(disp))
         return zero(disp)
@@ -144,8 +147,9 @@ function build_emulsion_system(x0_bulk::Vector{SVector{2,Float64}},
     # Molly.RectangularBoundary does not accept per-dimension periodic flags; use the
     # standard constructor (periodic in all dimensions) and handle x wrapping manually
     # for wall motion via wrap_x.
-    # Periodic in both x and y over the box; walls confine particles in y.
-    boundary = Molly.RectangularBoundary(SVector{2,Float64}(box_side, box_side))
+    # Periodic in x; standard span in y (we ignore y wrapping in force calculation).
+    y_span = box_side
+    boundary = Molly.RectangularBoundary(SVector{2,Float64}(box_side, y_span))
 
     atoms = Vector{Molly.Atom}(undef, n_total)
     for i in 1:n_oil
@@ -223,14 +227,71 @@ function enforce_wall_motion!(sys::Molly.System,
     end
 end
 
+# Keep bulk particles inside the gap in y by reflecting if they cross the walls.
+function confine_bulk_y!(sys::Molly.System, n_bulk::Int, y_min::Float64, y_max::Float64)
+    @inbounds for i in 1:n_bulk
+        pos = sys.coords[i]
+        vel = sys.velocities[i]
+        if pos[2] > y_max
+            new_y = 2y_max - pos[2]
+            sys.coords[i] = SVector(pos[1], new_y)
+            sys.velocities[i] = SVector(vel[1], -vel[2])
+        elseif pos[2] < y_min
+            new_y = 2y_min - pos[2]
+            sys.coords[i] = SVector(pos[1], new_y)
+            sys.velocities[i] = SVector(vel[1], -vel[2])
+        end
+    end
+end
+
+# Apply tangential drag near the walls to reduce slip. Drag is stronger closer to the wall.
+function apply_wall_drag!(sys::Molly.System,
+                          n_bulk::Int,
+                          wall_y_top::Float64,
+                          wall_y_bot::Float64,
+                          shear::ShearProfile,
+                          t::Real,
+                          gap::Real,
+                          box_side::Real;
+                          dt::Real,
+                          drag_coeff::Float64 = 1.5)
+    gamma, gamma_rate = shear_state(shear, t)
+    y_max = wall_y_top
+    y_min = wall_y_bot
+    v_top = wall_speed_from_shear_rate(gamma_rate, gap, :top)
+    v_bot = wall_speed_from_shear_rate(gamma_rate, gap, :bottom)
+
+    @inbounds for i in 1:n_bulk
+        pos = sys.coords[i]
+        vel = sys.velocities[i]
+
+        dist_top = max(0.0, y_max - pos[2])
+        dist_bot = max(0.0, pos[2] - y_min)
+
+        # Linear weights across the gap to cover the whole bulk and cancel at midplane.
+        w_top = max(0.0, 1.0 - dist_top / gap)
+        w_bot = max(0.0, 1.0 - dist_bot / gap)
+
+        w_sum = w_top + w_bot
+        if w_sum == 0
+            continue
+        end
+
+        v_target = (w_top * v_top + w_bot * v_bot) / w_sum
+        drag = (vel[1] - v_target) * w_sum
+        vx = vel[1] - drag_coeff * drag * dt
+        sys.velocities[i] = SVector(vx, vel[2])
+    end
+end
+
 # defining repulsion parameters, much more stable behaviour with bigger a_oil_water and smaller a_water_water/a_oil_oil
 const a_water_water = 5.0 # 5 <- better
 const a_oil_oil     = 5.0 # 5 <- better
 const a_oil_water   = 100.0 # 100 <- better
 
 const a_wall_wall   = 25.0
-const a_wall_water  = 25.0
-const a_wall_oil    = 80.0
+const a_wall_water  = 80.0
+const a_wall_oil    = 150.0
 
 # Map bead types to interaction strengths
 const A_MAP = Dict{Tuple{Int,Int},Float64}(
@@ -254,9 +315,9 @@ cutoff              = 1.0
 density_number      = 3.0    # particles per unit area
 
 # Rough wall configuration; motion is set later by the shear profile.
-n_per_wall     = 400
+n_per_wall     = 600
 wall_y_offset  = 0.5 * cutoff
-wall_roughness = 0.5 * cutoff
+wall_roughness = 0.8 * cutoff
 
 volume_oil   = volume_fraction_oil * box_side^2
 volume_water = (1.0 - volume_fraction_oil) * box_side^2
@@ -275,7 +336,10 @@ x_top, x_bot = make_rough_wall_particles(
 walls = vcat(x_top, x_bot)
 wall_bases = [SVector(w[1], w[2]) for w in walls]
 wall_sides = vcat(fill(:top, length(x_top)), fill(:bottom, length(x_bot)))
-wall_gap = average_wall_gap(x_top, x_bot)
+# Absolute coordinates with bottom at y=0.
+wall_y_bot_ref = wall_y_offset
+wall_y_top_ref = box_side - wall_y_offset
+wall_gap = wall_y_top_ref - wall_y_bot_ref
 
 # Generate initial positions for oil and water droplets
 x0_oil, x0_water = if volume_fraction_oil <= 0.5
@@ -338,7 +402,7 @@ v0_bulk  = [random_vec(SVector{2,Float64},(-0.1,0.1)) for _ in 1:n_bulk]
 v0_walls = [SVector{2,Float64}(0.0, 0.0) for _ in 1:n_walls]
 
 dt = 0.001
-T = 10.0
+T = 100.0
 nsteps = Int(round(T/dt))
 
 # Time-dependent shear strain gamma(t). Supply any lambda you like here; gammȧ(t)
@@ -381,6 +445,8 @@ end)
 post_wall! = isempty(wall_indices) ? nothing : (step_idx -> begin
     t = step_idx * dt
     enforce_wall_motion!(sys, wall_indices, wall_bases, wall_sides, shear_profile, t, wall_gap, box_side)
+    apply_wall_drag!(sys, n_bulk, wall_y_top_ref, wall_y_bot_ref, shear_profile, t, wall_gap, box_side, dt=dt)
+    confine_bulk_y!(sys, n_bulk, wall_y_bot_ref + cutoff, wall_y_top_ref - cutoff)
 end)
 
 simulator = VelocityVerlet(
@@ -416,8 +482,9 @@ fps = max(1, Int(round(frames / T)))
 # Report effective fps and subsampling for traceability
 println("Desired fps: ", desired_fps, ", save_every: ", save_every, ", frames saved: ", frames, ", effective fps: ", fps)
 
-# Wrap both coordinates into the primary simulation box for visualization.
-wrap_frame(frame) = [SVector(wrap_x(p[1], box_side), wrap_x(p[2], box_side)) for p in frame]
+# Wrap x for visualization; leave y unwrapped to inspect shear profile.
+side_x = sys.boundary.side_lengths[1]
+wrap_frame(frame) = [SVector(mod(p[1], side_x), p[2]) for p in frame]
 coords_history_wrapped = [wrap_frame(frame) for frame in coords_history]
 
 # Ensure output dir exists
