@@ -92,9 +92,16 @@ MyCoordinatesLogger(n_steps::Integer; dims::Integer=3) = MyCoordinatesLogger(Flo
 
 # Fallback manual trajectory collector with subsampling by save_every
 # Saves the initial frame, then every save_every steps, and always the final frame.
-function run_and_collect!(sys::Molly.System, simulator, nsteps::Integer; save_every::Integer=1)
+function run_and_collect!(sys::Molly.System, simulator, nsteps::Integer;
+                          save_every::Integer=1,
+                          pre_step!::Union{Nothing,Function}=nothing,
+                          post_step!::Union{Nothing,Function}=nothing)
     save_every = max(1, save_every)
     hist = Vector{Vector{SVector{2,Float64}}}()
+
+    if pre_step! !== nothing
+        pre_step!(0)
+    end
     push!(hist, copy(sys.coords))
 
     # Progress bar for simulation
@@ -104,7 +111,13 @@ function run_and_collect!(sys::Molly.System, simulator, nsteps::Integer; save_ev
     end
 
     for s in 1:nsteps
+        if pre_step! !== nothing
+            pre_step!(s)
+        end
         simulate!(sys, simulator, 1)
+        if post_step! !== nothing
+            post_step!(s)
+        end
         if s % save_every == 0 || s == nsteps
             push!(hist, copy(sys.coords))
         end
@@ -115,52 +128,70 @@ function run_and_collect!(sys::Molly.System, simulator, nsteps::Integer; save_ev
     return hist
 end
 
-function build_emulsion_system(x0_all::Vector{SVector{2,Float64}},
+function build_emulsion_system(x0_bulk::Vector{SVector{2,Float64}},
+                               x0_walls::Vector{SVector{2,Float64}},
                                n_oil::Int, n_water::Int,
-                               box_side::Float64, cutoff::Float64, velocities,
-                               nsteps::Integer)
+                               box_side::Float64, cutoff::Float64,
+                               bulk_velocities,
+                               wall_velocities,
+                               nsteps::Integer; periodic_y::Bool=false)
 
-# The commented out function below is an earlier version of build_emulsion_system with the walls - maybe useful, if not needed, can be deleted.
-# Build system: assign atom types so EmulsionInter can choose a_ij
-# function build_emulsion_system(x0_all::Vector{SVector{2,Float64}},
-#                                n_oil::Int, n_water::Int, n_topwall::Int, n_botwall::Int,
-#                                box_side::Float64, cutoff::Float64, velocities)
+    n_bulk_local = n_oil + n_water
+    n_walls = length(x0_walls)
+    n_total = n_bulk_local + n_walls
+    wall_range = n_walls == 0 ? (0:-1) : ((n_bulk_local+1):n_total)
 
-    boundary = Molly.RectangularBoundary(box_side) # define periodic 2D box
-    atoms = Vector{Molly.Atom}(undef, n_oil+n_water) # initialize atoms vector
-    
-    # oil
+    # Molly.RectangularBoundary does not accept per-dimension periodic flags; use the
+    # standard constructor (periodic in all dimensions) and handle x wrapping manually
+    # for wall motion via wrap_x.
+    # Periodic in both x and y over the box; walls confine particles in y.
+    boundary = Molly.RectangularBoundary(SVector{2,Float64}(box_side, box_side))
+
+    atoms = Vector{Molly.Atom}(undef, n_total)
     for i in 1:n_oil
-        atoms[i] = Molly.Atom(mass=1.0, atom_type=1) 
-       
+        atoms[i] = Molly.Atom(mass=1.0, atom_type=1)
     end
-    # water
     for i in (n_oil+1):(n_oil+n_water)
         atoms[i] = Molly.Atom(mass=1.0, atom_type=2)
-        
     end
-    # old walls implementation - delete if not needed
-    # for i in (n_oil+n_water+1):length(x0_all)
-    #     atoms[i] = Molly.Atom(mass=1.0, atom_type=3)
-    # end
-    
-    # Define neighbor finder using CellListMap (exactly the same as in our previous code)
-    # determine how many bulk particles we have locally
-    n_bulk_local = n_oil + n_water
+    for i in (n_bulk_local+1):n_total
+        atoms[i] = Molly.Atom(mass=1.0, atom_type=3)
+    end
+
+    coords_all = Vector{SVector{2,Float64}}(undef, n_total)
+    coords_all[1:n_bulk_local] = x0_bulk
+    if n_walls > 0
+        coords_all[wall_range] = x0_walls
+    end
+
+    velocities = Vector{SVector{2,Float64}}(undef, n_total)
+    velocities[1:n_bulk_local] = bulk_velocities
+    if n_walls > 0
+        wall_velocities = isempty(wall_velocities) ? [SVector{2,Float64}(0.0, 0.0) for _ in 1:n_walls] : wall_velocities
+        velocities[wall_range] = wall_velocities
+    end
+
+    eligible = trues(n_total, n_total)
+    @inbounds for i in 1:n_total
+        eligible[i,i] = false
+    end
+    if n_walls > 0
+        eligible[wall_range, wall_range] .= false  # keep rough wall beads rigid relative to each other
+    end
 
     cellListMap_finder = Molly.CellListMapNeighborFinder(
-        eligible=trues(n_bulk_local, n_bulk_local), # all bulk particles interact
+        eligible=eligible,
         dist_cutoff=cutoff,
-        x0=x0_all[1:n_bulk_local],
+        x0=coords_all,
         unit_cell = boundary,
-        n_steps = 10, # update neighbor list every 10 steps for efficiency
+        n_steps = 5, # update neighbors more often so moving walls stay accurate
         dims = 2,
     )
-    
+
     # Build Molly system that will be solved by a simulator
     sys = Molly.System(
         atoms = atoms,
-        coords = x0_all[1:n_bulk_local],
+        coords = coords_all,
         boundary = boundary,
         velocities = velocities,
         pairwise_inters = (MyPairwiseInter=EmulsionInter(cutoff),),
@@ -169,8 +200,29 @@ function build_emulsion_system(x0_all::Vector{SVector{2,Float64}},
         energy_units = Unitful.NoUnits,
         force_units = Unitful.NoUnits
     )
-    return sys
+    return sys, wall_range
 end
+
+# Update wall bead positions and velocities to follow the current shear state.
+function enforce_wall_motion!(sys::Molly.System,
+                              wall_indices::AbstractVector{Int},
+                              wall_bases::AbstractVector{SVector{2,Float64}},
+                              wall_sides::AbstractVector{Symbol},
+                              shear::ShearProfile,
+                              t::Real,
+                              gap::Real,
+                              box_side::Real)
+    gamma, gamma_rate = shear_state(shear, t)
+
+    @inbounds for (idx, base, side) in zip(wall_indices, wall_bases, wall_sides)
+        disp = wall_displacement_from_shear(gamma, gap, side)
+        speed = wall_speed_from_shear_rate(gamma_rate, gap, side)
+        x = wrap_x(base[1] + disp, box_side)
+        sys.coords[idx] = SVector(x, base[2])
+        sys.velocities[idx] = SVector(speed, 0.0)
+    end
+end
+
 # defining repulsion parameters, much more stable behaviour with bigger a_oil_water and smaller a_water_water/a_oil_oil
 const a_water_water = 5.0 # 5 <- better
 const a_oil_oil     = 5.0 # 5 <- better
@@ -201,6 +253,11 @@ box_side            = 32.2
 cutoff              = 1.0
 density_number      = 3.0    # particles per unit area
 
+# Rough wall configuration; motion is set later by the shear profile.
+n_per_wall     = 400
+wall_y_offset  = 0.5 * cutoff
+wall_roughness = 0.5 * cutoff
+
 volume_oil   = volume_fraction_oil * box_side^2
 volume_water = (1.0 - volume_fraction_oil) * box_side^2
 n_oil::Int   = ceil(volume_oil * density_number)
@@ -208,13 +265,19 @@ n_water::Int = ceil((box_side^2 - volume_oil) * density_number)
 
 n_droplets = 4
 
-# Commented out wall generation - can be deleted if not needed
-# n_per_wall = 400
-# x_top, x_bot = make_rough_wall_particles(SVector{2,Float64}, box_side, n_per_wall;
-#                                             y_offset = 0.0)
-# walls = vcat(x_top, x_bot)
+x_top, x_bot = make_rough_wall_particles(
+    SVector{2,Float64},
+    box_side,
+    n_per_wall;
+    y_offset = wall_y_offset,
+    y_amp = wall_roughness,
+)
+walls = vcat(x_top, x_bot)
+wall_bases = [SVector(w[1], w[2]) for w in walls]
+wall_sides = vcat(fill(:top, length(x_top)), fill(:bottom, length(x_bot)))
+wall_gap = average_wall_gap(x_top, x_bot)
 
-# Generate initial positions for oil and water droplets, the same as in our old code (walls commented out)
+# Generate initial positions for oil and water droplets
 x0_oil, x0_water = if volume_fraction_oil <= 0.5
     droplet_area = volume_oil / n_droplets          # area of ONE droplet
     R_droplet    = sqrt(droplet_area / pi)
@@ -237,7 +300,6 @@ x0_oil, x0_water = if volume_fraction_oil <= 0.5
         centers,
         R_used,
         box_side,
-        #walls,             # <- avoid walls too
     )
 
     x0_oil, x0_water
@@ -263,60 +325,86 @@ else
         centers,
         R_used,
         box_side,
-        #walls,             # <- avoid walls too
     )
 
     x0_oil, x0_water
 end
 
 x0_emulsion = vcat(x0_oil, x0_water)
-#x0_all_u      = vcat(x0_emulsion, walls)
-x0_all = [SVector(x[1], x[2]) for x in x0_emulsion]
 
 n_bulk   = length(x0_emulsion)   # = n_oil + n_water
-v0_all = [random_vec(SVector{2,Float64},(-0.1,0.1)) for _ in 1:n_bulk]
-
-# walls implementation - delete if not needed
-#n_wall   = length(walls)
-# n_total  = n_bulk + n_wall
-# n_topwall  = length(x_top)
-# n_botwall  = length(x_bot)
-# n_total    = length(x0_all)
-#v0_all = [SVector{2,Float64}(random_velocity(1.0, temp_val; dims=2)...) for _ in 1:n_bulk]
-#append!(v0_all, [SVector{2,Float64}(0.0, 0.0) for _ in 1:(n_topwall+n_botwall)])
+n_walls  = length(walls)
+v0_bulk  = [random_vec(SVector{2,Float64},(-0.1,0.1)) for _ in 1:n_bulk]
+v0_walls = [SVector{2,Float64}(0.0, 0.0) for _ in 1:n_walls]
 
 dt = 0.001
-T = 10
-nsteps = Int(T/dt)
+T = 10.0
+nsteps = Int(round(T/dt))
+
+# Time-dependent shear strain gamma(t). Supply any lambda you like here; gammȧ(t)
+# is approximated numerically inside make_shear_profile.
+gamma_fn = t -> 0.5 * t / T              # linear ramp to gamma=0.5 at t=T
+shear_profile = make_shear_profile(gamma_fn = gamma_fn)
 
 # Desired output fps; we will subsample to approximate this while keeping duration = T
 desired_fps = 60
 
 # Compute save_every from desired_fps; if not enough steps to reach target fps, save every frame
-# frames_target = desired_fps * T; save_every ≈ nsteps / frames_target
+# frames_target = desired_fps * T; save_every ~ nsteps / frames_target
 frames_target = max(1, Int(round(desired_fps * T)))
 save_every = max(1, Int(floor(nsteps / frames_target)))
 if save_every <= 0
     save_every = 1
 end
 
-sys = build_emulsion_system(x0_all, n_oil, n_water, box_side, cutoff, v0_all, nsteps)
+sys, wall_range = build_emulsion_system(
+    x0_emulsion,
+    walls,
+    n_oil,
+    n_water,
+    box_side,
+    cutoff,
+    v0_bulk,
+    v0_walls,
+    nsteps;
+    periodic_y=false,
+)
+wall_indices = collect(wall_range)
+
+pre_wall! = isempty(wall_indices) ? nothing : (step_idx -> begin
+    t = step_idx == 0 ? 0.0 : (step_idx - 1) * dt
+    enforce_wall_motion!(sys, wall_indices, wall_bases, wall_sides, shear_profile, t, wall_gap, box_side)
+end)
+post_wall! = isempty(wall_indices) ? nothing : (step_idx -> begin
+    t = step_idx * dt
+    enforce_wall_motion!(sys, wall_indices, wall_bases, wall_sides, shear_profile, t, wall_gap, box_side)
+end)
 
 simulator = VelocityVerlet(
     dt = dt
 )
 
 sim_time = @elapsed begin
-    coords_history = run_and_collect!(sys, simulator, nsteps; save_every=save_every)
+    coords_history = run_and_collect!(
+        sys,
+        simulator,
+        nsteps;
+        save_every=save_every,
+        pre_step! = pre_wall!,
+        post_step! = post_wall!,
+    )
 end
 println("Simulation completed in $sim_time seconds.")
+if isempty(coords_history) || isempty(coords_history[1])
+    error("No particle coordinates recorded; check system initialization.")
+end
 colors = [if i <= n_oil
             :yellow
         elseif i <= n_oil + n_water
             :blue
         else
             :gray
-        end for i in 1:length(x0_all)]
+        end for i in 1:length(sys.coords)]
 
 # Compute framerate so that video duration equals T seconds
 frames = length(coords_history)
@@ -325,12 +413,16 @@ fps = max(1, Int(round(frames / T)))
 # Report effective fps and subsampling for traceability
 println("Desired fps: ", desired_fps, ", save_every: ", save_every, ", frames saved: ", frames, ", effective fps: ", fps)
 
+# Wrap both coordinates into the primary simulation box for visualization.
+wrap_frame(frame) = [SVector(wrap_x(p[1], box_side), wrap_x(p[2], box_side)) for p in frame]
+coords_history_wrapped = [wrap_frame(frame) for frame in coords_history]
+
 # Ensure output dir exists
 outdir = joinpath(@__DIR__, "Molly_mp4")
 isdir(outdir) || mkpath(outdir) # Create directory if it doesn't exist
 
 # Build filename
-fname = "emulsion_molly_positive_velocity_verlet_dt$(dt)_aw$(a_oil_water)_ww$(a_water_water)_target$(desired_fps)_eff$(fps)_se$(save_every).mp4"
+fname = "emulsion_molly_shear_velocity_verlet_dt$(dt)_aw$(a_oil_water)_ww$(a_water_water)_target$(desired_fps)_eff$(fps)_se$(save_every).mp4"
 outfile = joinpath(outdir, fname)
 
 # Custom renderer with progress bar for video writing
@@ -339,20 +431,44 @@ function visualize_with_progress(
     boundary::Molly.RectangularBoundary,
     outfile;
     color,
-    markersize::Real=0.8,
+    markersize::Real=1.0,
     framerate::Integer=30,
 )
     frames = length(coords_history)
-    side = boundary.side_lengths[1]
+    isempty(coords_history) && error("No coordinates recorded; nothing to visualize.")
+
+    xmin = Inf; xmax = -Inf; ymin = Inf; ymax = -Inf
+    for frame in coords_history
+        for p in frame
+            x = p[1]; y = p[2]
+            if isfinite(x) && isfinite(y)
+                xmin = min(xmin, x); xmax = max(xmax, x)
+                ymin = min(ymin, y); ymax = max(ymax, y)
+            end
+        end
+    end
+    if !isfinite(xmin) || !isfinite(ymin)
+        error("Coordinates contain no finite values; cannot visualize trajectory.")
+    end
+    span_x = xmax - xmin
+    span_y = ymax - ymin
+    pad = 0.1 * max(max(span_x, span_y), 1.0)
 
     fig = GLMakie.Figure(size=(800,800))
-    ax = GLMakie.Axis(fig[1,1]; limits = (-side/2, side/2, -side/2, side/2), aspect = GLMakie.DataAspect())
+    ax = GLMakie.Axis(fig[1,1];
+        limits = (xmin - pad, xmax + pad, ymin - pad, ymax + pad),
+        aspect = GLMakie.DataAspect(),
+    )
 
-    N = length(coords_history[1])
-    xs = GLMakie.Observable([coords_history[1][i][1] for i in 1:N])
-    ys = GLMakie.Observable([coords_history[1][i][2] for i in 1:N])
+    first_frame = coords_history[1]
+    N = length(first_frame)
+    xs = GLMakie.Observable([first_frame[i][1] for i in 1:N])
+    ys = GLMakie.Observable([first_frame[i][2] for i in 1:N])
 
-    GLMakie.scatter!(ax, xs, ys; color=color, markersize=markersize)
+    # Scale marker sizes by particle type to make walls/oil more visible.
+    msizes = [i <= n_oil ? 6.0 : i <= n_oil + n_water ? 4.0 : 3.5 for i in 1:N]
+
+    GLMakie.scatter!(ax, xs, ys; color=color, markersize=msizes)
 
     # Progress for rendering
     local p = nothing
@@ -374,11 +490,10 @@ function visualize_with_progress(
 end
 
 visualize_with_progress(
-    coords_history,
+    coords_history_wrapped,
     sys.boundary,
     outfile;
     color = colors,
-    markersize = 0.8,
+    markersize = 1.0,
     framerate = fps,
 )
-

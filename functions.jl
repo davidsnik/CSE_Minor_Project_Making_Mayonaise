@@ -3,7 +3,7 @@ function generate_droplet_centers(n_droplets::Int,
                                   box_side::T,
                                   R::T;
                                   margin_factor::T = 1.5) where T
-    
+
     centers = SVector{2,T}[]
     min_dist = 2 * R * margin_factor
 
@@ -74,7 +74,8 @@ function generate_outside_droplets(n_water::Int,
                                    centers::Vector{SVector{2,T}},
                                    R::T,
                                    box_side::T) where T
-    wall_buffer = 0
+    wall_buffer = 2cutoff
+    interface_buffer = 0.5cutoff
     water = SVector{2,T}[]
     x_min, x_max = -box_side/2, box_side/2
     # keep away from walls in y by a small buffer as well
@@ -93,8 +94,8 @@ function generate_outside_droplets(n_water::Int,
         py = y_min + rand(T)*(y_max - y_min)
         p = SVector{2,T}(px, py)
 
-        # outside every droplet?
-        inside_any_droplet = any(norm(p - c) <= R for c in centers)
+        # outside every droplet with a small buffer so water isn't seeded on the interface
+        inside_any_droplet = any(norm(p - c) <= R + interface_buffer for c in centers)
 
         # not too close to any wall bead?
         close_to_wall = false
@@ -163,11 +164,88 @@ function make_rough_wall_particles(
     return x_top_vec, x_bot_vec
 end
 
+# --------------------------- Shear profiles --------------------------- #
+struct ShearProfile{F,G}
+    gamma::F        # gamma(t): shear strain at time t
+    gamma_rate::G   # gamma_dot(t): shear rate at time t
+end
+
+ShearProfile(gamma::F, gamma_rate::G) where {F<:Function,G<:Function} = ShearProfile{F,G}(gamma, gamma_rate)
+
+# Build a shear profile. Supply any gamma_fn you like, or pick a preset `kind`.
+# The shear rate is always computed numerically from gamma_fn for consistency.
+function make_shear_profile(; gamma_fn::Union{Nothing,Function}=nothing,
+                            kind::Symbol = :linear_ramp,
+                            gamma_final::Real = 0.5,
+                            ramp_time::Real = 1.0,
+                            gamma_rate::Real = 0.0,
+                            amplitude::Real = 0.5,
+                            frequency::Real = 1.0,
+                            phase::Real = 0.0,
+                            offset::Real = 0.0,
+                            gamma0::Real = 0.0)
+    if gamma_fn === nothing
+        if kind === :linear_ramp
+            slope = ramp_time == 0 ? zero(gamma_final) : (gamma_final - gamma0) / ramp_time
+            gamma_fn = t -> t <= ramp_time ? gamma0 + slope * t : gamma_final
+        elseif kind === :constant_rate
+            gamma_fn = t -> gamma0 + gamma_rate * t
+        elseif kind === :sinusoidal
+            omega = 2pi * frequency
+            gamma_fn = t -> offset + amplitude * sin(omega * t + phase)
+        else
+            error("Unknown shear profile kind: $kind")
+        end
+    end
+
+    # Always approximate the derivative numerically from gamma_fn.
+    rate_fn = t -> begin
+        h = 1e-6
+        (gamma_fn(t + h) - gamma_fn(t - h)) / (2h)
+    end
+
+    return ShearProfile(gamma_fn, rate_fn)
+end
+
+@inline shear_state(profile::ShearProfile, t) = (profile.gamma(t), profile.gamma_rate(t))
+
+@inline function wall_sign(side)
+    side === :top && return one(Int)
+    side === :bottom && return -one(Int)
+    throw(ArgumentError("side must be :top or :bottom, got $side"))
+end
+
+@inline function wall_displacement_from_shear(gamma::T, gap::T, side::Symbol) where T
+    return wall_sign(side) * gamma * gap / 2
+end
+
+@inline function wall_speed_from_shear_rate(gamma_rate::T, gap::T, side::Symbol) where T
+    return wall_sign(side) * gamma_rate * gap / 2
+end
+
+function average_wall_gap(top_wall::Vector{SVector{2,T}}, bot_wall::Vector{SVector{2,T}}) where T
+    isempty(top_wall) && error("top_wall is empty")
+    isempty(bot_wall) && error("bot_wall is empty")
+
+    y_top_sum = zero(T)
+    for w in top_wall
+        y_top_sum += w[2]
+    end
+    y_bot_sum = zero(T)
+    for w in bot_wall
+        y_bot_sum += w[2]
+    end
+
+    return y_top_sum / length(top_wall) - y_bot_sum / length(bot_wall)
+end
+
 function wall_velocity_from_shear(applied_shear, nsteps, dt, box_side; cutoff_local = cutoff)
     H = box_side - cutoff_local      # effective gap between walls
     T = nsteps * dt                  # total simulation time
-    return applied_shear * H / T
+    gamma_rate = applied_shear / T
+    return wall_speed_from_shear_rate(gamma_rate, H, :top)
 end
+
 # Periodic only in x (no wrapping in y)
 @inline function wrap_x(dx::T, side::T) where T
     dx = rem(dx, side)
