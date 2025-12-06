@@ -4,6 +4,8 @@ using Molly
 using GLMakie  # Make sure you have this loaded
 using Molly: PairwiseInteraction, simulate!, Verlet, random_velocity, visualize
 using Unitful
+using DelimitedFiles
+using Statistics
 using LinearAlgebra: norm
 # Optional progress bars
 const HAS_PROGRESSMETER = Ref(false)
@@ -284,6 +286,72 @@ function apply_wall_drag!(sys::Molly.System,
     end
 end
 
+function detect_clusters_from_file( #cluster detection andrej
+    filename::String;
+    box_side::Float64,
+    cutoff::Float64,
+    factor::Float64 = 1.2
+)
+    data = readdlm(filename)
+    N = size(data, 1)
+
+    coords = [(data[i,1], data[i,2]) for i in 1:N]
+    r2 = (factor * cutoff)^2
+
+    visited = falses(N)
+    clusters = Vector{Vector{Int}}()
+
+    for i in 1:N
+        visited[i] && continue
+
+        cluster = Int[]
+        stack = [i]
+        visited[i] = true
+
+        while !isempty(stack)
+            p = pop!(stack)
+            push!(cluster, p)
+
+            xi, yi = coords[p]
+
+            for j in 1:N
+                visited[j] && continue
+
+                xj, yj = coords[j]
+                dx = wrap_x(xj - xi, box_side)
+                dy = yj - yi
+
+                if dx*dx + dy*dy < r2
+                    visited[j] = true
+                    push!(stack, j)
+                end
+            end
+        end
+
+        push!(clusters, cluster)
+    end
+
+    return clusters
+end
+
+function analyze_clusters_simple(clusters, cutoff::Float64)
+    bead_radius = cutoff / 2
+    bead_area   = π * bead_radius^2
+
+    n_clusters = length(clusters)
+
+    beads_per_cluster = [length(c) for c in clusters]
+
+    radii = [
+        sqrt((length(c) * bead_area) / π)
+        for c in clusters
+    ]
+
+    avg_radius = mean(radii)
+
+    return n_clusters, beads_per_cluster, avg_radius
+end
+
 # defining repulsion parameters, much more stable behaviour with bigger a_oil_water and smaller a_water_water/a_oil_oil
 const a_water_water = 5.0 # 5 <- better
 const a_oil_oil     = 5.0 # 5 <- better
@@ -309,10 +377,11 @@ const A_MAP = Dict{Tuple{Int,Int},Float64}(
 # Setting random seed for reproducibility
 Random.seed!(1234)
 
-volume_fraction_oil = 0.3
+volume_fraction_oil = 0.3 # VF
 box_side            = 32.2
 cutoff              = 1.0
 density_number      = 3.0    # particles per unit area
+temperature = 273 #temp in kelvin
 
 # Rough wall configuration; motion is set later by the shear profile.
 n_per_wall     = 600
@@ -402,7 +471,7 @@ v0_bulk  = [random_vec(SVector{2,Float64},(-0.1,0.1)) for _ in 1:n_bulk]
 v0_walls = [SVector{2,Float64}(0.0, 0.0) for _ in 1:n_walls]
 
 dt = 0.001
-T = 100.0
+T = 5.0 #CHANGE TIME HERE
 nsteps = Int(round(T/dt))
 
 # Time-dependent shear strain gamma(t). Supply any lambda you like here; gammȧ(t)
@@ -567,3 +636,68 @@ visualize_with_progress(
     markersize = 1.0,
     framerate = fps,
 )
+
+# -----------------------
+# Take snapshot at a chosen physical time
+# -----------------------
+
+# Time between saved frames
+dt_frame = save_every * dt
+
+# Choose snapshot time (physical time)
+t_snap = 4.0   # seconds
+k_snap = round(Int, t_snap / dt_frame) + 1
+k_snap = clamp(k_snap, 1, length(coords_history_wrapped))
+
+# Extract snapshot
+frame_snap  = coords_history_wrapped[k_snap]
+oil_snapshot = frame_snap[1:n_oil]
+
+println("Snapshot taken at t = ",
+        (k_snap - 1) * dt_frame,
+        " with ",
+        n_oil,
+        " oil beads.")
+
+# -----------------------
+# Write snapshot to file
+# -----------------------
+
+snap_dir = joinpath(@__DIR__, "snapshots")
+isdir(snap_dir) || mkpath(snap_dir)
+
+snap_name = "oil_snapshot.txt"
+snap_file = joinpath(snap_dir, snap_name)
+
+data = hcat(
+    [p[1] for p in oil_snapshot],
+    [p[2] for p in oil_snapshot]
+)
+
+writedlm(snap_file, data)
+println("Oil snapshot written to ", snap_file)
+
+# -----------------------
+# Cluster detection
+# -----------------------
+
+wrap_x(dx, L) = dx - L * round(dx / L)
+
+
+
+clusters = detect_clusters_from_file(
+    snap_file;
+    box_side = box_side,
+    cutoff   = cutoff
+)
+
+data = readdlm(snap_file)
+coords = [(data[i,1], data[i,2]) for i in axes(data, 1)]
+
+n_clusters, beads_per_cluster, avg_radius =
+    analyze_clusters_simple(clusters, cutoff)
+
+println("Clusters: ", n_clusters,
+        " | beads per cluster: ", beads_per_cluster)
+
+println("Average effective radius: ", avg_radius)
