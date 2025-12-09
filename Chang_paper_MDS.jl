@@ -171,7 +171,7 @@ const density_number = 3
 const nsteps = 10^4
 const dt = 0.01
 
-for volume_fraction_oil in [0.2, 0.4, 0.6, 0.8, 0.95]
+for volume_fraction_oil in [0.2, 0.4, 0.6]
 
     volume_oil = volume_fraction_oil * box_side^2
 

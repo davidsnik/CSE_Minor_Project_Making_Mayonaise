@@ -2,7 +2,7 @@
 function generate_droplet_centers(n_droplets::Int,
                                   box_side::T,
                                   R::T;
-                                  margin_factor::T = 1.5) where T
+                                  margin_factor::T = 1.05) where T
     
     centers = SVector{2,T}[]
     min_dist = 2 * R * margin_factor
@@ -15,6 +15,7 @@ function generate_droplet_centers(n_droplets::Int,
     max_attempts = 10000
     attempt = 0
     while length(centers) < n_droplets
+       
         c = SVector{2,T}(
             x_min + rand(T)*(x_max - x_min),
             y_min + rand(T)*(y_max - y_min),
@@ -28,6 +29,7 @@ function generate_droplet_centers(n_droplets::Int,
         if attempt == max_attempts
             attempt = 0
             n_droplets -= 1
+            println("Could only place $(length(centers)) droplets. Reducing target to $(n_droplets).")
         end
     end
 
@@ -35,7 +37,7 @@ function generate_droplet_centers(n_droplets::Int,
 end
 
 # Generate oil positions in several identical circular droplets
-function generate_multi_droplet(n_oil::Int,
+function generate_multi_droplet(n_oil::Int, 
                                     centers::Vector{SVector{2,T}},
                                     droplet_area::T) where T
     n_droplets = length(centers)
@@ -47,6 +49,50 @@ function generate_multi_droplet(n_oil::Int,
     base = div(n_oil, n_droplets)
     extra = rem(n_oil, n_droplets)
     n_per = [base + (k <= extra ? 1 : 0) for k in 1:n_droplets]
+
+
+    for (k, center) in enumerate(centers)
+        for i in 1:n_per[k]
+            # uniform sampling in a disk: r = R*sqrt(u), theta in [0,2pi]
+            r = R * sqrt(rand(T))
+            theta = 2 * T(pi) * rand(T)
+            push!(oil, SVector{2,T}(
+                center[1] + r * cos(theta),
+                center[2] + r * sin(theta),
+            ))
+           
+        end
+    end
+
+    return oil, R
+end
+
+# Generate oil positions in several identical circular droplets
+function generate_multi_droplet_and_matrix(n_oil::Int, n_water::Int,
+                                    centers::Vector{SVector{2,T}},
+                                    droplet_area::T) where T
+    n_droplets = length(centers)
+    
+    R = sqrt(droplet_area / pi)  # radius of each droplet
+
+    oil = SVector{2,T}[]
+
+    # distribute particle counts as evenly as possible
+    base = div(n_oil, n_droplets)
+    extra = rem(n_oil, n_droplets)
+    n_per = [base + (k <= extra ? 1 : 0) for k in 1:n_droplets]
+   
+    # per-droplet blocks (Bool)
+    droplets_matrices = [falses(n_per[k], n_per[k]) for k in 1:n_droplets]
+
+    # assemble a dense block-diagonal matrix
+    droplets_matrix = trues(n_oil+n_water, n_oil+n_water)
+    offset = 0
+    for M in droplets_matrices
+        m = size(M, 1)
+        droplets_matrix[offset+1:offset+m, offset+1:offset+m] .= M
+        offset += m
+    end
 
     for (k, center) in enumerate(centers)
         for i in 1:n_per[k]
@@ -60,9 +106,8 @@ function generate_multi_droplet(n_oil::Int,
         end
     end
 
-    return oil, R
+    return oil, R, droplets_matrix, n_per
 end
-
 # Generate water particles outside all droplets
 # function generate_outside_droplets(n_water::Int,
 #                                    centers::Vector{SVector{2,T}},
@@ -177,4 +222,72 @@ function wrap_x(x::T, box_side::T) where T
     else
         return x
     end
+end
+
+function plot_matrix_sparsity(droplets_matrix)
+    fig = Figure(resolution=(800, 600))
+    ax = Axis(fig[1, 1],
+              title="Droplets Matrix Sparsity Pattern",
+              xlabel="Particle Index",
+              ylabel="Droplet Index",
+              yreversed=true)  # So row 1 is at the top
+    
+    
+    # Plot as heatmap
+    heatmap!(ax, droplets_matrix, 
+             colormap=:grays,
+             colorrange=(0, 1))
+    
+    # Add statistics
+    n_nonzero = count(!iszero, droplets_matrix)
+    n_total = length(droplets_matrix)
+    sparsity_pct = 100 * (1 - n_nonzero / n_total)
+    
+    Label(fig[2, 1], 
+          "Nonzero entries: $n_nonzero / $n_total ($(round(sparsity_pct, digits=1))% sparse)",
+          tellwidth=false)
+    
+    return fig
+end
+
+function plot_initial_positions(x0_oil, x0_water, box_side, n_per)
+    fig = Figure(resolution=(800, 800))
+    ax = Axis(fig[1, 1],
+              title="Initial Particle Positions",
+              xlabel="X Position",
+              ylabel="Y Position",
+              aspect=DataAspect())
+    
+    # Extract x and y coordinates for oil
+    oil_x = [p[1] for p in x0_oil]
+    oil_y = [p[2] for p in x0_oil]
+    
+    # Extract x and y coordinates for water
+    water_x = [p[1] for p in x0_water]
+    water_y = [p[2] for p in x0_water]
+    
+    # color each droplet differently - optional
+    droplet_colors = [RGB(rand(), rand(), rand()) for _ in 1:length(n_per)]
+    oil_colors = vcat([fill(droplet_colors[k], n_per[k]) for k in 1:length(n_per)]...)
+    
+    # Plot oil particles (yellow)
+    scatter!(ax, oil_x, oil_y, 
+             color=oil_colors,
+             markersize=8,
+             label="Oil (n=$(length(x0_oil)))")
+    
+    # Plot water particles (blue)
+    scatter!(ax, water_x, water_y,
+             color=:blue,
+             markersize=8,
+             label="Water (n=$(length(x0_water)))")
+    
+    # Set axis limits to box boundaries
+    xlims!(ax, -box_side/2, box_side/2)
+    ylims!(ax, -box_side/2, box_side/2)
+    
+    # Add legend
+    axislegend(ax, position=:rt)
+    
+    return fig
 end

@@ -254,56 +254,6 @@ function femulsion_plot(d,cutoff,a_ij)
     end
     return fₓ
 end
-
-# TODO these values have to be tweak
-# defining repulsion parameters
-const cutoff = 1.0
-const a_water_water = -25.0
-const a_oil_oil     = -25.0
-const a_oil_water   = -80.0
-
-const a_wall_wall   = -25.0
-const a_wall_water  = -25.0
-const a_wall_oil    = -80.0
-
-# Plotting the emulsion forces between particles
-using Plots
-d_values = 0:0.01:1.5*cutoff
-f_oo = [ femulsion_plot(d,cutoff,a_oil_oil) for d in d_values ]
-f_ww = [ femulsion_plot(d,cutoff,a_water_water) for d in d_values ]
-f_ow = [ femulsion_plot(d,cutoff,a_oil_water) for d in d_values ]
-
-if output_plots
-    plot(
-        d_values, f_oo,
-        label="Oil-Oil Interaction",
-        xlabel="Distance", ylabel="Force Magnitude",
-        title="Emulsion Interaction Forces",
-        legend=:topright,
-        linewidth=2,
-    )
-    plot!(
-        d_values, f_ww,
-        label="Water-Water Interaction",
-        linewidth=2,
-    )
-    plot!(
-        d_values, f_ow,
-        label="Oil-Water Interaction",
-        linewidth=2,
-    )
-    gif_dir = joinpath(@__DIR__, "gif_chang_MD")
-    isdir(gif_dir) || mkpath(gif_dir)
-    savefig(joinpath(gif_dir, "emulsion_forces_wall.png"))
-end
-
-
-# Defining simulation parameters for the emulsion MD simulation
-const box_side = 32.2
-const density_number = 3
-const nsteps = 10^4
-const dt = 0.01
-
 # Place n_droplets centers inside the box, separated by at least ~2R
 function generate_droplet_centers(n_droplets::Int,
                                   box_side::T,
@@ -470,8 +420,58 @@ function wall_velocity_from_shear(applied_shear, nsteps, dt, box_side; cutoff_lo
     return applied_shear * H / T
 end
 
-for volume_fraction_oil in [0.2, 0.4, 0.6, 0.8, 0.95]
-    for applied_shear in [1.0]
+
+# TODO these values have to be tweak
+# defining repulsion parameters
+cutoff = 1.0
+const a_water_water = -25.0
+const a_oil_oil     = -25.0
+const a_oil_water   = -80.0
+
+const a_wall_wall   = -25.0
+const a_wall_water  = -25.0
+const a_wall_oil    = -80.0
+
+# Plotting the emulsion forces between particles
+using Plots
+d_values = 0:0.01:1.5*cutoff
+f_oo = [ femulsion_plot(d,cutoff,a_oil_oil) for d in d_values ]
+f_ww = [ femulsion_plot(d,cutoff,a_water_water) for d in d_values ]
+f_ow = [ femulsion_plot(d,cutoff,a_oil_water) for d in d_values ]
+
+if output_plots
+    plot(
+        d_values, f_oo,
+        label="Oil-Oil Interaction",
+        xlabel="Distance", ylabel="Force Magnitude",
+        title="Emulsion Interaction Forces",
+        legend=:topright,
+        linewidth=2,
+    )
+    plot!(
+        d_values, f_ww,
+        label="Water-Water Interaction",
+        linewidth=2,
+    )
+    plot!(
+        d_values, f_ow,
+        label="Oil-Water Interaction",
+        linewidth=2,
+    )
+    gif_dir = joinpath(@__DIR__, "gif_chang_MD")
+    isdir(gif_dir) || mkpath(gif_dir)
+    savefig(joinpath(gif_dir, "emulsion_forces_wall.png"))
+end
+
+
+# Defining simulation parameters for the emulsion MD simulation
+box_side = 32.2
+density_number = 3.0
+nsteps = 10^4
+dt = 0.001
+
+for volume_fraction_oil in [0.3]
+    for applied_shear in [0]
         volume_oil   = volume_fraction_oil * box_side^2
         volume_water = (1.0 - volume_fraction_oil) * box_side^2
         n_oil::Int   = ceil(volume_oil * density_number)
