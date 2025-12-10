@@ -257,7 +257,8 @@ function apply_wall_drag!(sys::Molly.System,
                           box_side::Real;
                           dt::Real,
                           drag_coeff::Float64 = 1.5,
-                          rate_ref::Float64 = 1.0)
+                          rate_ref::Float64 = 1.0,
+                          rate_floor::Float64 = 0.1)
     gamma, gamma_rate = shear_state(shear, t)
     y_max = wall_y_top
     y_min = wall_y_bot
@@ -281,7 +282,10 @@ function apply_wall_drag!(sys::Molly.System,
         end
 
         v_target = (w_top * v_top + w_bot * v_bot) / w_sum
-        rate_scale = abs(gamma_rate) / max(rate_ref, eps(rate_ref))
+        # Normalize by the reference shear rate so drag strength tracks the shear profile.
+        # Keep a small floor so some damping remains even when gamma_rate is near zero.
+        rate_scale = rate_ref <= eps(Float64) ? rate_floor :
+                     max(abs(gamma_rate) / max(rate_ref, eps(rate_ref)), rate_floor)
         drag = rate_scale * (vel[1] - v_target) * w_sum
         vx = vel[1] - drag_coeff * drag * dt
         sys.velocities[i] = SVector(vx, vel[2])
@@ -479,7 +483,7 @@ nsteps = Int(round(T/dt))
 # Time-dependent shear strain gamma(t). Supply any lambda you like here; gammȧ(t)
 # is approximated numerically inside make_shear_profile.
 shear_freq = 0.5            # cycles per unit time; adjust as needed
-gamma_amplitude = 0.0       # peak strain
+gamma_amplitude = 0.5       # peak strain
 gamma_phase = 0.0
 gamma_fn = t -> gamma_amplitude * sin(2*pi*shear_freq*t + gamma_phase)
 shear_profile = make_shear_profile(gamma_fn = gamma_fn)
