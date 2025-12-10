@@ -256,7 +256,8 @@ function apply_wall_drag!(sys::Molly.System,
                           gap::Real,
                           box_side::Real;
                           dt::Real,
-                          drag_coeff::Float64 = 1.5)
+                          drag_coeff::Float64 = 1.5,
+                          rate_ref::Float64 = 1.0)
     gamma, gamma_rate = shear_state(shear, t)
     y_max = wall_y_top
     y_min = wall_y_bot
@@ -280,7 +281,8 @@ function apply_wall_drag!(sys::Molly.System,
         end
 
         v_target = (w_top * v_top + w_bot * v_bot) / w_sum
-        drag = (vel[1] - v_target) * w_sum
+        rate_scale = abs(gamma_rate) / max(rate_ref, eps(rate_ref))
+        drag = rate_scale * (vel[1] - v_target) * w_sum
         vx = vel[1] - drag_coeff * drag * dt
         sys.velocities[i] = SVector(vx, vel[2])
     end
@@ -477,10 +479,15 @@ nsteps = Int(round(T/dt))
 # Time-dependent shear strain gamma(t). Supply any lambda you like here; gammȧ(t)
 # is approximated numerically inside make_shear_profile.
 shear_freq = 0.5            # cycles per unit time; adjust as needed
-gamma_amplitude = 0.5       # peak strain
+gamma_amplitude = 0.0       # peak strain
 gamma_phase = 0.0
 gamma_fn = t -> gamma_amplitude * sin(2*pi*shear_freq*t + gamma_phase)
 shear_profile = make_shear_profile(gamma_fn = gamma_fn)
+
+# Precompute a reference shear rate over the simulation span to normalize drag strength.
+rate_samples = [abs(shear_profile.gamma_rate(t)) for t in range(0, stop=T, length=101)]
+gamma_rate_ref = maximum(rate_samples)
+gamma_rate_ref = gamma_rate_ref <= eps(Float64) ? 1.0 : gamma_rate_ref
 
 # Desired output fps; we will subsample to approximate this while keeping duration = T
 desired_fps = 60
@@ -514,7 +521,7 @@ end)
 post_wall! = isempty(wall_indices) ? nothing : (step_idx -> begin
     t = step_idx * dt
     enforce_wall_motion!(sys, wall_indices, wall_bases, wall_sides, shear_profile, t, wall_gap, box_side)
-    apply_wall_drag!(sys, n_bulk, wall_y_top_ref, wall_y_bot_ref, shear_profile, t, wall_gap, box_side, dt=dt)
+    apply_wall_drag!(sys, n_bulk, wall_y_top_ref, wall_y_bot_ref, shear_profile, t, wall_gap, box_side, dt=dt, rate_ref=gamma_rate_ref)
     confine_bulk_y!(sys, n_bulk, wall_y_bot_ref + cutoff, wall_y_top_ref - cutoff)
 end)
 
