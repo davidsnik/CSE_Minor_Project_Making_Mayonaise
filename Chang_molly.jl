@@ -258,12 +258,15 @@ function apply_wall_drag!(sys::Molly.System,
                           dt::Real,
                           drag_coeff::Float64 = 1.5,
                           rate_ref::Float64 = 1.0,
-                          rate_floor::Float64 = 0.1)
+                          rate_floor::Float64 = 0.1,
+                          decay_length_frac::Float64 = 0.4,
+                          decay_power::Float64 = 2.0)
     gamma, gamma_rate = shear_state(shear, t)
     y_max = wall_y_top
     y_min = wall_y_bot
     v_top = wall_speed_from_shear_rate(gamma_rate, gap, :top)
     v_bot = wall_speed_from_shear_rate(gamma_rate, gap, :bottom)
+    ell = max(decay_length_frac * gap, eps(Float64))
 
     @inbounds for i in 1:n_bulk
         pos = sys.coords[i]
@@ -272,9 +275,9 @@ function apply_wall_drag!(sys::Molly.System,
         dist_top = max(0.0, y_max - pos[2])
         dist_bot = max(0.0, pos[2] - y_min)
 
-        # Linear weights across the gap to cover the whole bulk and cancel at midplane.
-        w_top = max(0.0, 1.0 - dist_top / gap)
-        w_bot = max(0.0, 1.0 - dist_bot / gap)
+        # Power-law decay of drag influence away from each wall.
+        w_top = max(0.0, 1.0 - (dist_top / ell)^decay_power)
+        w_bot = max(0.0, 1.0 - (dist_bot / ell)^decay_power)
 
         w_sum = w_top + w_bot
         if w_sum == 0
@@ -525,7 +528,8 @@ end)
 post_wall! = isempty(wall_indices) ? nothing : (step_idx -> begin
     t = step_idx * dt
     enforce_wall_motion!(sys, wall_indices, wall_bases, wall_sides, shear_profile, t, wall_gap, box_side)
-    apply_wall_drag!(sys, n_bulk, wall_y_top_ref, wall_y_bot_ref, shear_profile, t, wall_gap, box_side, dt=dt, rate_ref=gamma_rate_ref)
+    apply_wall_drag!(sys, n_bulk, wall_y_top_ref, wall_y_bot_ref, shear_profile, t, wall_gap, box_side,
+                     dt=dt, rate_ref=gamma_rate_ref)
     confine_bulk_y!(sys, n_bulk, wall_y_bot_ref + cutoff, wall_y_top_ref - cutoff)
 end)
 
