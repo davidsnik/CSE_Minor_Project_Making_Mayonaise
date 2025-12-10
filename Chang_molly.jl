@@ -36,17 +36,48 @@ struct EmulsionInter{T} <: PairwiseInteraction
 end
 Molly.use_neighbors(::EmulsionInter) = true # use neighbor lists; x-wrapping handled in force
 
+# minimum-image helper for displacements
+@inline wrap_delta(d::Real, L::Real) = d - L * round(d / L)
+
+# Centralized force definition; potential is computed by integrating this force,
+# so changing this function automatically changes both force and energy.
+@inline function emulsion_force_magnitude(a_ij::Real, r::Real, cutoff::Real)
+    if r >= cutoff
+        return 0.0
+    end
+    return a_ij * (1 - r/cutoff)
+end
+
+# Numerically integrate the force to obtain the potential (zero at r = cutoff).
+# This keeps the potential consistent if the force law changes.
+@inline function emulsion_potential_from_force(a_ij::Real, r::Real, cutoff::Real; n_quad::Int=6)
+    if r >= cutoff
+        return 0.0
+    end
+    dr = (cutoff - r) / n_quad
+    acc = 0.0
+    x = r
+    f_prev = emulsion_force_magnitude(a_ij, x, cutoff)
+    @inbounds for _ in 1:n_quad
+        x += dr
+        f_curr = emulsion_force_magnitude(a_ij, x, cutoff)
+        acc += 0.5 * (f_prev + f_curr) * dr
+        f_prev = f_curr
+    end
+    return acc
+end
+
+@inline function emulsion_force_potential(a_ij::Real, r::Real, cutoff::Real)
+    fmag = emulsion_force_magnitude(a_ij, r, cutoff)
+    U = emulsion_potential_from_force(a_ij, r, cutoff)
+    return fmag, U
+end
+
 # Pairwise scalar force law (depends only on scalar distance between particles "r")
 function Molly.pairwise_force(inter::EmulsionInter, r, params)
-    a_ij, repulsive = params
-    if r > inter.cutoff
-        return 0.0
-    # huge repulsive force is temporarily disabled
-    # elseif repulsive && r < 1e-12
-    #     return 3000 * (1 - r/inter.cutoff)
-    else
-        return a_ij * (1 - r/inter.cutoff)
-    end
+    a_ij, _ = params
+    fmag, _ = emulsion_force_potential(a_ij, r, inter.cutoff)
+    return fmag
 end
 
 # Vector force along minimum distance vector between particles i and j
@@ -63,9 +94,10 @@ function Molly.force(inter::EmulsionInter,
                      velocity_j,
                      step_n)
 
-    # Recompute displacement to wrap only in x; do not wrap in y to avoid asymmetric image artifacts.
+    # Recompute displacement to wrap in x and optionally y (y only if periodic_y_mode).
     dx = wrap_x(coord_j[1] - coord_i[1], boundary.side_lengths[1])
-    dy = coord_j[2] - coord_i[2]
+    dy_raw = coord_j[2] - coord_i[2]
+    dy = periodic_y_mode ? wrap_delta(dy_raw, boundary.side_lengths[2]) : dy_raw
     disp = SVector(dx, dy)
     r = norm(disp)
     # Guard against r = 0 to avoid division by zero
@@ -81,7 +113,7 @@ function Molly.force(inter::EmulsionInter,
     repulsive = a_ij == a_oil_oil # specify if there should be strong surfactant like repulsion betwen two particles 
     params = (a_ij, repulsive)
 
-    fmag = Molly.pairwise_force(inter, r, params) # get scalar force magnitude
+    fmag, _ = emulsion_force_potential(a_ij, r, inter.cutoff) # get scalar force magnitude
     return fmag * disp / r 
 end
 
@@ -246,6 +278,15 @@ function confine_bulk_y!(sys::Molly.System, n_bulk::Int, y_min::Float64, y_max::
     end
 end
 
+# Apply periodic wrapping in y (used when walls are disabled).
+function apply_periodic_y!(sys::Molly.System, n_bulk::Int, box_side::Float64)
+    @inbounds for i in 1:n_bulk
+        pos = sys.coords[i]
+        y_wrapped = mod(pos[2], box_side)
+        sys.coords[i] = SVector(pos[1], y_wrapped)
+    end
+end
+
 # Apply tangential drag near the walls to reduce slip. Drag is stronger closer to the wall.
 function apply_wall_drag!(sys::Molly.System,
                           n_bulk::Int,
@@ -361,6 +402,34 @@ function analyze_clusters_simple(clusters, cutoff::Float64)
     return n_clusters, beads_per_cluster, avg_radius
 end
 
+# Total energy (kinetic + potential) using the same interaction as the force.
+function emulsion_energy(sys::Molly.System, cutoff::Float64, box_side::Float64; n_bulk_only::Union{Nothing,Int}=nothing)
+    N = n_bulk_only === nothing ? length(sys.coords) : n_bulk_only
+
+    E_kin = 0.0
+    @inbounds for i in 1:N
+        E_kin += 0.5 * sys.atoms[i].mass * sum(abs2, sys.velocities[i])
+    end
+
+    E_pot = 0.0
+    @inbounds for i in 1:N-1
+        ti = sys.atoms[i].atom_type
+        xi = sys.coords[i]
+        for j in i+1:N
+            tj = sys.atoms[j].atom_type
+            a = get(A_MAP, (ti, tj), 0.0)
+            dx = wrap_x(sys.coords[j][1] - xi[1], box_side)
+            dy_raw = sys.coords[j][2] - xi[2]
+            dy = periodic_y_mode ? wrap_delta(dy_raw, box_side) : dy_raw
+            r = sqrt(dx*dx + dy*dy)
+            _, U = emulsion_force_potential(a, r, cutoff)
+            E_pot += U
+        end
+    end
+
+    return E_kin + E_pot, E_kin, E_pot
+end
+
 # defining repulsion parameters, much more stable behaviour with bigger a_oil_water and smaller a_water_water/a_oil_oil
 const a_water_water = 25.0 # 5 <- better
 const a_oil_oil     = 25.0 # 5 <- better
@@ -391,6 +460,9 @@ box_side            = 32.2
 cutoff              = 1.0
 density_number      = 3.0    # particles per unit area
 temperature = 273 #temp in kelvin
+enable_walls    = false           # set false to disable walls and use periodic y instead
+periodic_y_mode = !enable_walls
+enable_energy_logging = false     # set false to skip energy calc/logging for speed
 
 # Rough wall configuration; motion is set later by the shear profile.
 n_per_wall     = 600
@@ -404,20 +476,29 @@ n_water::Int = ceil((box_side^2 - volume_oil) * density_number)
 
 n_droplets = 4
 
-x_top, x_bot = make_rough_wall_particles(
-    SVector{2,Float64},
-    box_side,
-    n_per_wall;
-    y_offset = wall_y_offset,
-    y_amp = wall_roughness,
-)
-walls = vcat(x_top, x_bot)
-wall_bases = [SVector(w[1], w[2]) for w in walls]
-wall_sides = vcat(fill(:top, length(x_top)), fill(:bottom, length(x_bot)))
-# Absolute coordinates with bottom at y=0.
-wall_y_bot_ref = wall_y_offset
-wall_y_top_ref = box_side - wall_y_offset
-wall_gap = wall_y_top_ref - wall_y_bot_ref
+if enable_walls
+    x_top, x_bot = make_rough_wall_particles(
+        SVector{2,Float64},
+        box_side,
+        n_per_wall;
+        y_offset = wall_y_offset,
+        y_amp = wall_roughness,
+    )
+    walls = vcat(x_top, x_bot)
+    wall_bases = [SVector(w[1], w[2]) for w in walls]
+    wall_sides = vcat(fill(:top, length(x_top)), fill(:bottom, length(x_bot)))
+    # Absolute coordinates with bottom at y=0.
+    wall_y_bot_ref = wall_y_offset
+    wall_y_top_ref = box_side - wall_y_offset
+    wall_gap = wall_y_top_ref - wall_y_bot_ref
+else
+    walls = SVector{2,Float64}[]
+    wall_bases = SVector{2,Float64}[]
+    wall_sides = Symbol[]
+    wall_y_bot_ref = 0.0
+    wall_y_top_ref = box_side
+    wall_gap = wall_y_top_ref - wall_y_bot_ref
+end
 
 # Generate initial positions for oil and water droplets
 x0_oil, x0_water = if volume_fraction_oil <= 0.5
@@ -441,7 +522,8 @@ x0_oil, x0_water = if volume_fraction_oil <= 0.5
         n_water,
         centers,
         R_used,
-        box_side,
+        box_side;
+        wall_buffer = enable_walls ? 2cutoff : 0.0,
     )
 
     x0_oil, x0_water
@@ -466,7 +548,8 @@ else
         n_oil,
         centers,
         R_used,
-        box_side,
+        box_side;
+        wall_buffer = enable_walls ? 2cutoff : 0.0,
     )
 
     x0_oil, x0_water
@@ -517,9 +600,18 @@ sys, wall_range = build_emulsion_system(
     v0_bulk,
     v0_walls,
     nsteps;
-    periodic_y=false,
+    periodic_y=periodic_y_mode,
 )
 wall_indices = collect(wall_range)
+
+energy_history = Float64[]
+time_history = Float64[]
+if enable_energy_logging
+    # initial energies (t=0)
+    E0, _, _ = emulsion_energy(sys, cutoff, box_side; n_bulk_only=n_bulk)
+    push!(energy_history, E0)
+    push!(time_history, 0.0)
+end
 
 pre_wall! = isempty(wall_indices) ? nothing : (step_idx -> begin
     t = step_idx == 0 ? 0.0 : (step_idx - 1) * dt
@@ -531,7 +623,25 @@ post_wall! = isempty(wall_indices) ? nothing : (step_idx -> begin
     apply_wall_drag!(sys, n_bulk, wall_y_top_ref, wall_y_bot_ref, shear_profile, t, wall_gap, box_side,
                      dt=dt, rate_ref=gamma_rate_ref)
     confine_bulk_y!(sys, n_bulk, wall_y_bot_ref + cutoff, wall_y_top_ref - cutoff)
+    if enable_energy_logging && (step_idx % save_every == 0 || step_idx == nsteps)
+        Etot, _, _ = emulsion_energy(sys, cutoff, box_side; n_bulk_only=n_bulk)
+        push!(energy_history, Etot)
+        push!(time_history, step_idx * dt)
+    end
 end)
+
+# Periodic-y hook (used when walls are disabled).
+post_periodic! = periodic_y_mode ? (step_idx -> begin
+    apply_periodic_y!(sys, n_bulk, box_side)
+    if enable_energy_logging && (step_idx % save_every == 0 || step_idx == nsteps)
+        Etot, _, _ = emulsion_energy(sys, cutoff, box_side; n_bulk_only=n_bulk)
+        push!(energy_history, Etot)
+        push!(time_history, step_idx * dt)
+    end
+end) : nothing
+
+pre_hook  = periodic_y_mode ? nothing       : pre_wall!
+post_hook = periodic_y_mode ? post_periodic! : post_wall!
 
 simulator = VelocityVerlet(
     dt = dt
@@ -543,8 +653,8 @@ sim_time = @elapsed begin
         simulator,
         nsteps;
         save_every=save_every,
-        pre_step! = pre_wall!,
-        post_step! = post_wall!,
+        pre_step! = pre_hook,
+        post_step! = post_hook,
     )
 end
 println("Simulation completed in $sim_time seconds.")
@@ -566,9 +676,11 @@ fps = max(1, Int(round(frames / T)))
 # Report effective fps and subsampling for traceability
 println("Desired fps: ", desired_fps, ", save_every: ", save_every, ", frames saved: ", frames, ", effective fps: ", fps)
 
-# Wrap x for visualization; leave y unwrapped to inspect shear profile.
+# Wrap x (and y if periodic) for visualization.
 side_x = sys.boundary.side_lengths[1]
-wrap_frame(frame) = [SVector(mod(p[1], side_x), p[2]) for p in frame]
+wrap_frame(frame) = periodic_y_mode ?
+    [SVector(mod(p[1], side_x), mod(p[2], box_side)) for p in frame] :
+    [SVector(mod(p[1], side_x), p[2]) for p in frame]
 coords_history_wrapped = [wrap_frame(frame) for frame in coords_history]
 
 # Ensure output dir exists
@@ -651,6 +763,18 @@ visualize_with_progress(
     markersize = 1.0,
     framerate = fps,
 )
+
+# -----------------------
+# Plot energy vs time
+# -----------------------
+if enable_energy_logging && !isempty(energy_history)
+    figE = GLMakie.Figure(size=(600,400))
+    axE = GLMakie.Axis(figE[1,1]; xlabel="time", ylabel="total energy")
+    GLMakie.lines!(axE, time_history, energy_history, color=:black)
+    energy_outfile = joinpath(outdir, "energy_vs_time.png")
+    GLMakie.save(energy_outfile, figE)
+    println("Saved energy plot to ", energy_outfile)
+end
 
 # -----------------------
 # Take snapshot at a chosen physical time
