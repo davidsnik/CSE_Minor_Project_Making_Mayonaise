@@ -39,8 +39,6 @@ Molly.use_neighbors(::EmulsionInter) = true # use neighbor lists; x-wrapping han
 # minimum-image helper for displacements
 @inline wrap_delta(d::Real, L::Real) = d - L * round(d / L)
 
-# Centralized force definition; potential is computed by integrating this force,
-# so changing this function automatically changes both force and energy.
 @inline function emulsion_force_magnitude(a_ij::Real, r::Real, cutoff::Real)
     if r >= cutoff
         return 0.0
@@ -48,28 +46,16 @@ Molly.use_neighbors(::EmulsionInter) = true # use neighbor lists; x-wrapping han
     return a_ij * (1 - r/cutoff)
 end
 
-# Numerically integrate the force to obtain the potential (zero at r = cutoff).
-# This keeps the potential consistent if the force law changes.
-@inline function emulsion_potential_from_force(a_ij::Real, r::Real, cutoff::Real; n_quad::Int=6)
+@inline function emulsion_potential(a_ij::Real, r::Real, cutoff::Real)
     if r >= cutoff
         return 0.0
     end
-    dr = (cutoff - r) / n_quad
-    acc = 0.0
-    x = r
-    f_prev = emulsion_force_magnitude(a_ij, x, cutoff)
-    @inbounds for _ in 1:n_quad
-        x += dr
-        f_curr = emulsion_force_magnitude(a_ij, x, cutoff)
-        acc += 0.5 * (f_prev + f_curr) * dr
-        f_prev = f_curr
-    end
-    return acc
+    return a_ij * (0.5*cutoff - r + r^2/(2*cutoff))
 end
 
 @inline function emulsion_force_potential(a_ij::Real, r::Real, cutoff::Real)
     fmag = emulsion_force_magnitude(a_ij, r, cutoff)
-    U = emulsion_potential_from_force(a_ij, r, cutoff)
+    U = emulsion_potential(a_ij, r, cutoff)
     return fmag, U
 end
 
@@ -462,7 +448,7 @@ density_number      = 3.0    # particles per unit area
 temperature = 273 #temp in kelvin
 enable_walls    = false           # set false to disable walls and use periodic y instead
 periodic_y_mode = !enable_walls
-enable_energy_logging = false     # set false to skip energy calc/logging for speed
+enable_energy_logging = true     # set false to skip energy calc/logging for speed
 
 # Rough wall configuration; motion is set later by the shear profile.
 n_per_wall     = 600
