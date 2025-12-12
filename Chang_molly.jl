@@ -2,7 +2,7 @@ using Random
 using StaticArrays
 using Molly
 using GLMakie  # Make sure you have this loaded
-using Molly: PairwiseInteraction, simulate!, Verlet, random_velocity, visualize
+using Molly: PairwiseInteraction, simulate!, Verlet, random_velocity, visualize, Langevin
 using Unitful
 using DelimitedFiles
 using Statistics
@@ -264,6 +264,16 @@ function confine_bulk_y!(sys::Molly.System, n_bulk::Int, y_min::Float64, y_max::
     end
 end
 
+# Compute proxy temperature from kinetic energy (k_B = 1).
+@inline function current_temperature(sys::Molly.System, n_bulk::Int)
+    ke = 0.0
+    @inbounds for i in 1:n_bulk
+        ke += 0.5 * sys.atoms[i].mass * sum(abs2, sys.velocities[i])
+    end
+    # 2 degrees of freedom per particle (2D), k_B = 1
+    return 2 * ke / (2 * n_bulk)
+end
+
 # Apply periodic wrapping in y (used when walls are disabled).
 function apply_periodic_y!(sys::Molly.System, n_bulk::Int, box_side::Float64)
     @inbounds for i in 1:n_bulk
@@ -446,9 +456,11 @@ box_side            = 32.2
 cutoff              = 1.0
 density_number      = 3.0    # particles per unit area
 temperature = 273 #temp in kelvin
-enable_walls    = false           # set false to disable walls and use periodic y instead
+enable_walls    = true           # set false to disable walls and use periodic y instead
 periodic_y_mode = !enable_walls
 enable_energy_logging = true     # set false to skip energy calc/logging for speed
+enable_langevin = true           # thermostat toggle
+gamma_langevin = 0.5             # friction coefficient for Langevin thermostat
 
 # Rough wall configuration; motion is set later by the shear profile.
 n_per_wall     = 600
@@ -545,17 +557,17 @@ x0_emulsion = vcat(x0_oil, x0_water)
 
 n_bulk   = length(x0_emulsion)   # = n_oil + n_water
 n_walls  = length(walls)
-v0_bulk  = [random_vec(SVector{2,Float64},(-0.1,0.1)) for _ in 1:n_bulk]
+v0_bulk  = [random_velocity(1.0, temperature; dims=2) for _ in 1:n_bulk]
 v0_walls = [SVector{2,Float64}(0.0, 0.0) for _ in 1:n_walls]
 
 dt = 0.001
-T = 5.0 #CHANGE TIME HERE
+T = 10.0 #CHANGE TIME HERE
 nsteps = Int(round(T/dt))
 
 # Time-dependent shear strain gamma(t). Supply any lambda you like here; gammȧ(t)
 # is approximated numerically inside make_shear_profile.
 shear_freq = 0.5            # cycles per unit time; adjust as needed
-gamma_amplitude = 0.5       # peak strain
+gamma_amplitude = 0.0       # peak strain
 gamma_phase = 0.0
 gamma_fn = t -> gamma_amplitude * sin(2*pi*shear_freq*t + gamma_phase)
 shear_profile = make_shear_profile(gamma_fn = gamma_fn)
@@ -592,12 +604,17 @@ wall_indices = collect(wall_range)
 
 energy_history = Float64[]
 time_history = Float64[]
+temperature_history = Float64[]
+temperature_time = Float64[]
 if enable_energy_logging
     # initial energies (t=0)
     E0, _, _ = emulsion_energy(sys, cutoff, box_side; n_bulk_only=n_bulk)
     push!(energy_history, E0)
     push!(time_history, 0.0)
 end
+temp0 = current_temperature(sys, n_bulk)  # proxy temperature (k_B=1)
+push!(temperature_history, temp0)
+push!(temperature_time, 0.0)
 
 pre_wall! = isempty(wall_indices) ? nothing : (step_idx -> begin
     t = step_idx == 0 ? 0.0 : (step_idx - 1) * dt
@@ -614,6 +631,11 @@ post_wall! = isempty(wall_indices) ? nothing : (step_idx -> begin
         push!(energy_history, Etot)
         push!(time_history, step_idx * dt)
     end
+    if step_idx % save_every == 0 || step_idx == nsteps
+        temp_inst = current_temperature(sys, n_bulk)
+        push!(temperature_history, temp_inst)
+        push!(temperature_time, step_idx * dt)
+    end
 end)
 
 # Periodic-y hook (used when walls are disabled).
@@ -624,14 +646,19 @@ post_periodic! = periodic_y_mode ? (step_idx -> begin
         push!(energy_history, Etot)
         push!(time_history, step_idx * dt)
     end
+    if step_idx % save_every == 0 || step_idx == nsteps
+        temp_inst = current_temperature(sys, n_bulk)
+        push!(temperature_history, temp_inst)
+        push!(temperature_time, step_idx * dt)
+    end
 end) : nothing
 
 pre_hook  = periodic_y_mode ? nothing       : pre_wall!
 post_hook = periodic_y_mode ? post_periodic! : post_wall!
 
-simulator = VelocityVerlet(
-    dt = dt
-)
+simulator = enable_langevin ?
+    Langevin(dt = dt, temperature = temperature, friction = gamma_langevin) :
+    VelocityVerlet(dt = dt)
 
 sim_time = @elapsed begin
     coords_history = run_and_collect!(
@@ -760,6 +787,16 @@ if enable_energy_logging && !isempty(energy_history)
     energy_outfile = joinpath(outdir, "energy_vs_time.png")
     GLMakie.save(energy_outfile, figE)
     println("Saved energy plot to ", energy_outfile)
+end
+
+# Plot temperature vs time
+if !isempty(temperature_history)
+    figT = GLMakie.Figure(size=(600,400))
+    axT = GLMakie.Axis(figT[1,1]; xlabel="time", ylabel="kinetic temperature")
+    GLMakie.lines!(axT, temperature_time, temperature_history, color=:red)
+    temp_outfile = joinpath(outdir, "temperature_vs_time.png")
+    GLMakie.save(temp_outfile, figT)
+    println("Saved temperature plot to ", temp_outfile)
 end
 
 # -----------------------
