@@ -1,0 +1,174 @@
+function visualize_with_progress(
+    coords_history::Vector{Vector{SVector{2,Float64}}},
+    boundary::Molly.RectangularBoundary,
+    outfile::String;
+    color,
+    markersize::Real=1.0,
+    framerate::Integer=30,
+    droplet_ranges::Vector{UnitRange{Int}},
+    box_side::Float64,
+    hulls_idx::Vector{Vector{Int}} = Vector{Vector{Int}}[],
+    droplet_colors::Vector{RGB{Float64}},
+)
+    frames = length(coords_history)
+    isempty(coords_history) && error("No coordinates recorded; nothing to visualize.")
+
+    # Axis limits from full trajectory (as before)
+    xmin = Inf; xmax = -Inf; ymin = Inf; ymax = -Inf
+    for frame in coords_history
+        for p in frame
+            x = p[1]; y = p[2]
+            if isfinite(x) && isfinite(y)
+                xmin = min(xmin, x); xmax = max(xmax, x)
+                ymin = min(ymin, y); ymax = max(ymax, y)
+            end
+        end
+    end
+    if !isfinite(xmin) || !isfinite(ymin)
+        error("Coordinates contain no finite values; cannot visualize trajectory.")
+    end
+    span_x = xmax - xmin
+    span_y = ymax - ymin
+    pad = 0.1 * max(max(span_x, span_y), 1.0)
+
+    fig = GLMakie.Figure(size=(800,800))
+    ax = GLMakie.Axis(fig[1,1];
+        limits = (xmin - pad, xmax + pad, ymin - pad, ymax + pad),
+        aspect = GLMakie.DataAspect(),
+    )
+
+    # Scatter setup (as before)
+    first_frame = coords_history[1]
+    N = length(first_frame)
+    xs = GLMakie.Observable([first_frame[i][1] for i in 1:N])
+    ys = GLMakie.Observable([first_frame[i][2] for i in 1:N])
+    msizes = [i <= n_oil ? 6.0 : i <= n_oil + n_water ? 4.0 : 3.5 for i in 1:N]
+    GLMakie.scatter!(ax, xs, ys; color=color, markersize=msizes)
+
+    # Hull line observables per droplet
+    n_drops = length(droplet_ranges)
+    hull_pts_obs = [GLMakie.Observable(GLMakie.Point2f[]) for _ in 1:n_drops]
+
+    # Pre-create lines for each droplet, colored with droplet_colors
+    for k in 1:n_drops
+        GLMakie.lines!(ax, hull_pts_obs[k]; color=droplet_colors[k], linewidth=2);
+    end
+
+    # Progress for rendering
+    local p = nothing
+    if HAS_PROGRESSMETER[]
+        p = ProgressMeter.Progress(frames; desc="Rendering", dt=0.2)
+    end
+
+    # Helper: compute hull ring coords for a droplet within a frame
+    compute_hull_coords = function(frame::Vector{SVector{2,Float64}}, dr::UnitRange{Int}, hull_indx::Vector{Int}=hulls_idx[1])
+        pts = frame[dr]
+        length(pts) < 3 && return GLMakie.Point2f[]
+        # Local x wrap around mean
+        xref = Statistics.mean(p[1] for p in pts)
+        rewrap_x(x) = xref + wrap_x(x - xref, box_side)
+        pts_rw = [(rewrap_x(p[1]), p[2]) for p in pts]
+
+        # Build polyline with NaN breaks when crossing the box in x to avoid long wrap lines
+        ps = GLMakie.Point2f[]
+        nidx = length(hull_indx)
+        for k in 1:nidx
+            i = hull_indx[k]
+            j = hull_indx[mod1(k+1, nidx)]  # next vertex (wrap around)
+            p1 = pts_rw[i]; p2 = pts_rw[j]
+            push!(ps, GLMakie.Point2f(p1[1], p1[2]))
+            dx = p2[1] - p1[1]
+            if abs(dx) > box_side/2
+                # insert break to avoid drawing across periodic seam
+                push!(ps, GLMakie.Point2f(NaN, NaN))
+            end
+        end
+        # Close polygon: add first point again unless last segment already NaN-broken
+        if isempty(ps) || !(isnan(ps[end][1]) || isnan(ps[end][2]))
+            first_idx = hull_indx[1]
+            push!(ps, GLMakie.Point2f(pts_rw[first_idx][1], pts_rw[first_idx][2]))
+        end
+        return ps
+    end
+
+    GLMakie.record(fig, outfile, 1:frames; framerate=framerate) do i
+        ci = coords_history[i]
+        @inbounds for k in 1:N
+            xs[][k] = ci[k][1]
+            ys[][k] = ci[k][2]
+        end
+        GLMakie.notify(xs); GLMakie.notify(ys)
+
+        # Update each droplet hull
+        for (idx, dr) in enumerate(droplet_ranges)
+            pts_h = compute_hull_coords(ci, dr, hulls_idx[idx])
+            hull_pts_obs[idx][] = pts_h
+            GLMakie.notify(hull_pts_obs[idx])
+        end
+
+        if p !== nothing
+            ProgressMeter.next!(p)
+        end
+    end
+end
+
+
+# Plot the droplet arrangement for verification (with the convex hulls)
+
+function plot_hull_points(x0_oil::Vector{SVector{2,T}}, 
+                          hulls_idx::Vector{Vector{Int}}, 
+                          n_per::Vector{Int};
+                          show_all_oil::Bool = true,
+                          box_side::Union{Nothing,Float64} = nothing) where T
+    
+    fig = Figure(size=(800, 800))
+    ax = Axis(fig[1, 1]; 
+              title="Convex Hull Points", 
+              xlabel="x", 
+              ylabel="y", 
+              aspect=DataAspect())
+    
+    # Optionally plot all oil particles in background
+    if show_all_oil
+        scatter!(ax, [p[1] for p in x0_oil], [p[2] for p in x0_oil]; 
+                 color=:lightgray, markersize=3, label="All Oil")
+    end
+    
+    # Plot hull points for each droplet
+    offset = 0
+    for (k, hull_local_idx) in enumerate(hulls_idx)
+        # Convert local indices (within droplet) to global indices (within x0_oil)
+        global_indices = hull_local_idx .+ offset
+        
+        # Extract hull points
+        hull_points = [x0_oil[i] for i in global_indices]
+        hull_xs = [p[1] for p in hull_points]
+        hull_ys = [p[2] for p in hull_points]
+        
+        # Plot hull points with unique color per droplet
+        scatter!(ax, hull_xs, hull_ys; 
+                 markersize=8, 
+                 label=(k==1 ? "Hull Points" : nothing))
+        
+        # Optionally draw lines connecting hull points
+        # Close the polygon by adding first point at end
+        push!(hull_xs, hull_xs[1])
+        push!(hull_ys, hull_ys[1])
+        lines!(ax, hull_xs, hull_ys; 
+               color=:red, 
+               linewidth=2,
+               label=(k==1 ? "Hull Outline" : nothing))
+        
+        offset += n_per[k]
+    end
+    
+    # Set axis limits if box_side is provided
+    if box_side !== nothing
+        xlims!(ax, 0, box_side)
+        ylims!(ax, 0, box_side)
+    end
+    
+    axislegend(ax; position=:lt)
+    
+    return fig
+end
