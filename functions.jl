@@ -167,8 +167,8 @@ end
 function generate_outside_droplets(n_water::Int,
                                    centers::Vector{SVector{2,T}},
                                    R::T,
-                                   box_side::T) where T
-    wall_buffer = 2cutoff
+                                   box_side::T;
+                                   wall_buffer::T = 2cutoff) where T
     interface_buffer = 0.5cutoff
     water = SVector{2,T}[]
     x_min, x_max = zero(T), box_side
