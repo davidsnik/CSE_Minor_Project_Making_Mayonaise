@@ -459,6 +459,7 @@ temperature = 273 #temp in kelvin
 enable_walls    = true           # set false to disable walls and use periodic y instead
 periodic_y_mode = !enable_walls
 enable_energy_logging = true     # set false to skip energy calc/logging for speed
+enable_wall_drag = true          # toggle extra wall drag application
 enable_langevin = true           # thermostat toggle
 gamma_langevin = 0.5             # friction coefficient for Langevin thermostat
 
@@ -623,8 +624,10 @@ end)
 post_wall! = isempty(wall_indices) ? nothing : (step_idx -> begin
     t = step_idx * dt
     enforce_wall_motion!(sys, wall_indices, wall_bases, wall_sides, shear_profile, t, wall_gap, box_side)
-    apply_wall_drag!(sys, n_bulk, wall_y_top_ref, wall_y_bot_ref, shear_profile, t, wall_gap, box_side,
-                     dt=dt, rate_ref=gamma_rate_ref)
+    if enable_wall_drag
+        apply_wall_drag!(sys, n_bulk, wall_y_top_ref, wall_y_bot_ref, shear_profile, t, wall_gap, box_side,
+                         dt=dt, rate_ref=gamma_rate_ref)
+    end
     confine_bulk_y!(sys, n_bulk, wall_y_bot_ref + cutoff, wall_y_top_ref - cutoff)
     if enable_energy_logging && (step_idx % save_every == 0 || step_idx == nsteps)
         Etot, _, _ = emulsion_energy(sys, cutoff, box_side; n_bulk_only=n_bulk)
