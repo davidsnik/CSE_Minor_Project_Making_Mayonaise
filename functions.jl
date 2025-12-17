@@ -70,7 +70,7 @@ end
 # Generate oil positions in several identical circular droplets
 function generate_multi_droplet_and_matrix(n_oil::Int, n_water::Int,
                                     centers::Vector{SVector{2,T}},
-                                    droplet_area::T, surface_concentration::T) where T
+                                    droplet_area::T) where T
     n_droplets = length(centers)
     
     R = sqrt(droplet_area / pi)  # radius of each droplet
@@ -94,68 +94,19 @@ function generate_multi_droplet_and_matrix(n_oil::Int, n_water::Int,
         offset += m
     end
 
-    # Store convex hulls for each droplet
-    convex_hulls = Vector{Vector{Int}}()  # indices within each droplet
-    convex_hull_coords = Vector{Vector{SVector{2,T}}}()  # actual coordinates
-    hulls = Vector{Any}()
-    
     for (k, center) in enumerate(centers)
-        droplet_points = SVector{2,T}[]
-        
-        nr_beads_boundary = Int(ceil(n_per[k]*surface_concentration))
-       
-        angle_increment = 2 * pi / nr_beads_boundary
         for i in 1:n_per[k]
-            if i < nr_beads_boundary + 1
-                # dense bounary
-                r = R
-                theta = (i-1) * angle_increment
-                
-            else
-                # uniform sampling in a disk: r = R*sqrt(u), theta in [0,2pi]
-                r = R * sqrt(rand(T))
-                theta = 2 * T(pi) * rand(T)
-            end
-            p = SVector{2,T}(
+            # uniform sampling in a disk: r = R*sqrt(u), theta in [0,2pi]
+            r = R * sqrt(rand(T))
+            theta = 2 * T(pi) * rand(T)
+            push!(oil, SVector{2,T}(
                 center[1] + r * cos(theta),
                 center[2] + r * sin(theta),
-            )
-            push!(oil, p)
-            push!(droplet_points, p)
+            ))
         end
-        
-        # Compute convex hull using GeometryOps
-        # Convert to tuples for GeometryOps
-        points_tuples = [(p[1], p[2]) for p in droplet_points]
-        hull_polygon = convex_hull(points_tuples)
-
-        push!(hulls, hull_polygon)
-
-       
-        
-        # Extract coordinates from the polygon
-        hull_coords = GeoInterface.coordinates(hull_polygon)[1]  # Get exterior ring
-        
-        # Extract hull indices by matching coordinates
-        hull_indices = Int[]
-        hull_svecs = SVector{2,T}[]
-        
-        for hull_pt in hull_coords[1:end-1]  # Last point repeats the first in closed polygons
-            for (idx, pt) in enumerate(droplet_points)
-                if abs(pt[1] - hull_pt[1]) < 1e-10 && abs(pt[2] - hull_pt[2]) < 1e-10
-                    push!(hull_indices, idx)
-                    push!(hull_svecs, pt)
-                    break
-                end
-            end
-        end
-        
-        push!(convex_hulls, hull_indices)
-        push!(convex_hull_coords, hull_svecs)
     end
-    
 
-    return oil, R, droplets_matrix, n_per, hulls, convex_hulls, convex_hull_coords
+    return oil, R, droplets_matrix, n_per
 end
 # Generate water particles outside all droplets
 # function generate_outside_droplets(n_water::Int,
@@ -348,8 +299,3 @@ function wrap_x(x::T, box_side::T) where T
         return x
     end
 end
-
-
-
-
-
