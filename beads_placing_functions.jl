@@ -70,7 +70,7 @@ end
 # Generate oil positions in several identical circular droplets
 function generate_multi_droplet_and_matrix(n_oil::Int, n_water::Int,
                                     centers::Vector{SVector{2,T}},
-                                    droplet_area::T, surface_concentration::T) where T
+                                    droplet_area::T, surface_concentration::T, ligh_spring_stiffness::T) where T
     n_droplets = length(centers)
     
     R = sqrt(droplet_area / pi)  # radius of each droplet
@@ -98,6 +98,13 @@ function generate_multi_droplet_and_matrix(n_oil::Int, n_water::Int,
     convex_hulls = Vector{Vector{Int}}()  # indices within each droplet
     convex_hull_coords = Vector{Vector{SVector{2,T}}}()  # actual coordinates
     hulls = Vector{Any}()
+
+    # arrays to store indices of oil beads connected to the center via light springs
+    center_indices = Int[]
+    spring_end_indices = Int[]
+    light_bonds_type = Vector{HarmonicBond}()
+    current_global_idx = 1
+    current_center_idx = 1
     
     for (k, center) in enumerate(centers)
         droplet_points = SVector{2,T}[]
@@ -106,7 +113,12 @@ function generate_multi_droplet_and_matrix(n_oil::Int, n_water::Int,
        
         angle_increment = 2 * pi / nr_beads_boundary
         for i in 1:n_per[k]
-            if i < nr_beads_boundary + 1
+            if i == 1
+                # place in the center
+                r=0.0
+                theta=0.0
+                current_center_idx = current_global_idx
+            elseif i < nr_beads_boundary + 2
                 # dense bounary
                 r = R
                 theta = (i-1) * angle_increment
@@ -122,7 +134,15 @@ function generate_multi_droplet_and_matrix(n_oil::Int, n_water::Int,
             )
             push!(oil, p)
             push!(droplet_points, p)
+            if i > nr_beads_boundary + 1
+                push!(center_indices, current_center_idx)
+                push!(spring_end_indices, current_global_idx)
+                push!(light_bonds_type, HarmonicBond(ligh_spring_stiffness, r))
+            end
+
+            current_global_idx += 1
         end
+       
         
         # Compute convex hull using GeometryOps
         # Convert to tuples for GeometryOps
@@ -153,10 +173,12 @@ function generate_multi_droplet_and_matrix(n_oil::Int, n_water::Int,
         push!(convex_hulls, hull_indices)
         push!(convex_hull_coords, hull_svecs)
     end
-    
+    light_spring_interactions = InteractionList2Atoms(center_indices, spring_end_indices, light_bonds_type)
 
-    return oil, R, droplets_matrix, n_per, hulls, convex_hulls, convex_hull_coords
+    return oil, R, droplets_matrix, n_per, hulls, convex_hulls, convex_hull_coords, light_spring_interactions
 end
+
+
 # Generate water particles outside all droplets
 # function generate_outside_droplets(n_water::Int,
 #                                    centers::Vector{SVector{2,T}},
@@ -167,8 +189,8 @@ end
 function generate_outside_droplets(n_water::Int,
                                    centers::Vector{SVector{2,T}},
                                    R::T,
-                                   box_side::T) where T
-    wall_buffer = 2cutoff
+                                   box_side::T;
+                                   wall_buffer::T = 2cutoff) where T
     interface_buffer = 0.5cutoff
     water = SVector{2,T}[]
     x_min, x_max = zero(T), box_side
@@ -219,3 +241,5 @@ function generate_outside_droplets(n_water::Int,
 
     return water
 end
+
+   

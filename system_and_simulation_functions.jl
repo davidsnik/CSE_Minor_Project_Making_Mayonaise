@@ -55,7 +55,6 @@ function build_emulsion_system(x0_bulk::Vector{SVector{2,Float64}},
                                bulk_velocities,
                                wall_velocities,
                                surface_idx,
-                               bond_is, bond_js,
                                global_hulls_idx,
                                bonds_type,
                                nsteps::Integer; periodic_y::Bool=false)
@@ -104,9 +103,11 @@ function build_emulsion_system(x0_bulk::Vector{SVector{2,Float64}},
     # eligible = falses(n_total, n_total)
     # eligible[1:n_bulk_local, 1:n_bulk_local] = cluster_matrix
     eligible = trues(n_total, n_total)
+    # Disable self-interactions
     @inbounds for i in 1:n_total
         eligible[i,i] = false
     end
+    # Disable interactions within each droplet hull
     for k in length(global_hulls_idx)
         hull = global_hulls_idx[k]
         for i in hull, j in hull

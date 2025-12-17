@@ -78,7 +78,7 @@ function apply_soft_hull_wall!(sys::Molly.System,
                 v_t = v - v_n * n_sel
                 p_rw_new = p_rw - (sdist + buffer) * n_sel # push back inside with buffer
                 #sys.coords[gi] = SVector(wrap_x(p_rw_new[1], box_side), p_rw_new[2])
-                sys.velocities[gi] = (-v_n) * n_sel +  v_t
+                sys.velocities[gi] = abs(v_n) * -n_sel +  v_t
             end
 
             
@@ -96,6 +96,48 @@ function local_idx_global(hull_local_idx, particles_per_droplet)
         offset += particles_per_droplet[k]
     end
     return global_hulls_idx
+end
+
+# Inter-droplet repulsion: push hull beads of different droplets apart to prevent penetration.
+function apply_inter_droplet_repulsion!(
+    sys::Molly.System,
+    surface_particles_idx::Vector{Vector{Int}},
+    box_side::Float64;
+    dt::Float64,
+    k_rep::Float64,
+    r_cut::Float64 = 0.3,
+)
+    n_drops = length(surface_particles_idx)
+    n_drops < 2 && return
+
+    @inbounds for i in 1:(n_drops - 1)
+        ring_i = surface_particles_idx[i]
+        for j in (i + 1):n_drops
+            ring_j = surface_particles_idx[j]
+            # Check all pairs of hull beads between droplet i and j
+            for gi in ring_i
+                pi = sys.coords[gi]
+                for gj in ring_j
+                    pj = sys.coords[gj]
+                    dx = wrap_x(pj[1] - pi[1], box_side)
+                    dy = pj[2] - pi[2]
+                    r = sqrt(dx^2 + dy^2)
+                    r < 1e-12 && continue
+                    r > r_cut && continue
+
+                    # Linear repulsion: force magnitude increases as beads get closer
+                    fmag = k_rep * (1.0 - r / r_cut) * dt
+                    n_hat = SVector(dx, dy) / r
+                    # Debug check for unit vector; keep lightweight
+                    abs(norm(n_hat) - 1) < 1e-6 || @warn "n_hat not unit" norm(n_hat)
+
+                    # Push both beads apart along the line connecting them
+                    sys.velocities[gi] = sys.velocities[gi] - fmag * n_hat
+                    sys.velocities[gj] = sys.velocities[gj] + fmag * n_hat
+                end
+            end
+        end
+    end
 end
 
 # Maintain droplet area by adding outward velocity to hull beads when area shrinks.

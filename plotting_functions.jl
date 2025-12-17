@@ -11,6 +11,7 @@ function visualize_with_progress(
     droplet_colors::Vector{RGB{Float64}},
 )
     frames = length(coords_history)
+
     isempty(coords_history) && error("No coordinates recorded; nothing to visualize.")
 
     # Axis limits from full trajectory (as before)
@@ -43,7 +44,17 @@ function visualize_with_progress(
     xs = GLMakie.Observable([first_frame[i][1] for i in 1:N])
     ys = GLMakie.Observable([first_frame[i][2] for i in 1:N])
     msizes = [i <= n_oil ? 6.0 : i <= n_oil + n_water ? 4.0 : 3.5 for i in 1:N]
-    GLMakie.scatter!(ax, xs, ys; color=color, markersize=msizes)
+    mcolors = copy(color)
+    # Enlarge and color the first bead of each droplet as a red marker
+    for dr in droplet_ranges
+        isempty(dr) && continue
+        first_idx = first(dr)
+        if first_idx <= N
+            msizes[first_idx] = 10.0
+            mcolors[first_idx] = RGB(1.0, 0.0, 0.0)
+        end
+    end
+    GLMakie.scatter!(ax, xs, ys; color=mcolors, markersize=msizes)
 
     # Hull line observables per droplet
     n_drops = length(droplet_ranges)

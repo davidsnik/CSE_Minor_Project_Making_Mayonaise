@@ -35,6 +35,7 @@ function make_rough_wall_particles(
     return x_top_vec, x_bot_vec
 end
 
+
 # --------------------------- Shear profiles --------------------------- #
 struct ShearProfile{F,G}
     gamma::F        # gamma(t): shear strain at time t
@@ -128,12 +129,16 @@ function apply_wall_drag!(sys::Molly.System,
                           box_side::Real;
                           dt::Real,
                           drag_coeff::Float64 = 1.5,
-                          rate_ref::Float64 = 1.0)
+                          rate_ref::Float64 = 1.0,
+                          rate_floor::Float64 = 0.1,
+                          decay_length_frac::Float64 = 0.4,
+                          decay_power::Float64 = 2.0)
     gamma, gamma_rate = shear_state(shear, t)
     y_max = wall_y_top
     y_min = wall_y_bot
     v_top = wall_speed_from_shear_rate(gamma_rate, gap, :top)
     v_bot = wall_speed_from_shear_rate(gamma_rate, gap, :bottom)
+    ell = max(decay_length_frac * gap, eps(Float64))
 
     @inbounds for i in 1:n_bulk
         pos = sys.coords[i]
@@ -142,9 +147,9 @@ function apply_wall_drag!(sys::Molly.System,
         dist_top = max(0.0, y_max - pos[2])
         dist_bot = max(0.0, pos[2] - y_min)
 
-        # Linear weights across the gap to cover the whole bulk and cancel at midplane.
-        w_top = max(0.0, 1.0 - dist_top / gap)
-        w_bot = max(0.0, 1.0 - dist_bot / gap)
+        # Power-law decay of drag influence away from each wall.
+        w_top = max(0.0, 1.0 - (dist_top / ell)^decay_power)
+        w_bot = max(0.0, 1.0 - (dist_bot / ell)^decay_power)
 
         w_sum = w_top + w_bot
         if w_sum == 0
@@ -152,7 +157,10 @@ function apply_wall_drag!(sys::Molly.System,
         end
 
         v_target = (w_top * v_top + w_bot * v_bot) / w_sum
-        rate_scale = abs(gamma_rate) / max(rate_ref, eps(rate_ref))
+        # Normalize by the reference shear rate so drag strength tracks the shear profile.
+        # Keep a small floor so some damping remains even when gamma_rate is near zero.
+        rate_scale = rate_ref <= eps(Float64) ? rate_floor :
+                     max(abs(gamma_rate) / max(rate_ref, eps(rate_ref)), rate_floor)
         drag = rate_scale * (vel[1] - v_target) * w_sum
         vx = vel[1] - drag_coeff * drag * dt
         sys.velocities[i] = SVector(vx, vel[2])

@@ -25,3 +25,12 @@ function wrap_x(x::T, box_side::T) where T
         return x
     end
 end
+
+# Apply periodic wrapping in y (used when walls are disabled).
+function apply_periodic_y!(sys::Molly.System, n_bulk::Int, box_side::Float64)
+    @inbounds for i in 1:n_bulk
+        pos = sys.coords[i]
+        y_wrapped = mod(pos[2], box_side)
+        sys.coords[i] = SVector(pos[1], y_wrapped)
+    end
+end
