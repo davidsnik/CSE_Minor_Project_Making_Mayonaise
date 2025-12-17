@@ -19,6 +19,7 @@ catch
     @warn "ProgressMeter.jl not available; progress bars will be disabled."
 end
 
+#region -------- Include function files --------
 #include(joinpath(@__DIR__, "functions.jl"))
 
 # After each include there is a list of functions made available.
@@ -40,8 +41,9 @@ include(joinpath(@__DIR__, "plotting_functions.jl"))
 include(joinpath(@__DIR__, "cluster_functions.jl"))
 # detect_clusters_from_file, analyze_clusters_simple
 
+#endregion
 
-
+#region -------- Define system and simulation parameters --------
 # -------- Interaction parameters --------
 # defining repulsion parameters, much more stable behaviour with bigger a_oil_water and smaller a_water_water/a_oil_oil
 const a_water_water = 15.0 # 5 <- better
@@ -89,6 +91,7 @@ temperature = 273                   # temp in kelvin
 
 # ------------- Droplet settings ------------
 n_droplets = 20
+enable_hulls = true                 # toggle droplet hulls (this includes bonding along hulls)
 surface_concentration = 0.1         # fraction of particles on droplet surface
 bond_stiffness_main = 100.0         # Bond stiffness for main hull bonds (i and i+1)
 bond_stiffness_god = 50.0           # Bond stiffness for center bead bonds
@@ -115,19 +118,18 @@ gamma_fn = t -> gamma_amplitude * sin(2*pi*shear_freq*t + gamma_phase)
 
 # ------------ Simulation settings ----------
 enable_energy_logging = true     # set false to skip energy calc/logging for speed
-enable_langevin = true           # thermostat toggle
+enable_langevin = true          # thermostat toggle
 gamma_langevin = 0.5             # friction coefficient for Langevin thermostat
-dt = 0.00001
-T = 100*dt                           #CHANGE TIME HERE
+dt = 0.0001
+T = 10000*dt                           #CHANGE TIME HERE
 nsteps = Int(round(T/dt))
 # Desired output fps; we will subsample to approximate this while keeping duration = T
-desired_fps = 1
-realistic_time = true          # if true, output fps matches desired fps; if false, the video plays in real time and desired fps is disregarded
+desired_fps = 100
+realistic_time = false          # if true, the video plays in real time and desired fps is disregarded; if false, output fps matches desired fps 
 output_folder = "Bouncy_droplets_with_walls" # folder to save visualization output (mp4, temp plot, energy plot)
 # -------------------------------------------
-
-
-# ------- Initialize wall particles --------
+#endregion
+#region -------- Initialize wall particles --------
 if enable_walls
     x_top, x_bot = make_rough_wall_particles(
         SVector{2,Float64},
@@ -151,8 +153,8 @@ else
     wall_y_top_ref = box_side
     wall_gap = wall_y_top_ref - wall_y_bot_ref
 end
-
-# ------- Initialize droplet particles and hulls --------
+#endregion
+#region -------- Initialize droplet particles and hulls --------
 volume_oil   = volume_fraction_oil * box_side^2
 volume_water = (1.0 - volume_fraction_oil) * box_side^2
 n_oil::Int   = ceil(volume_oil * density_number)
@@ -199,76 +201,83 @@ n_walls  = length(walls)
 v0_bulk  = [random_velocity(1.0, temperature; dims=2) for _ in 1:n_bulk]
 v0_walls = [SVector{2,Float64}(0.0, 0.0) for _ in 1:n_walls]
 
-surface_particles_idx = local_idx_global(hulls_idx, n_per)
-# Check if there are any duplicate surface indices
-all_surface_indices = vcat(surface_particles_idx)
+if enable_hulls
+    surface_particles_idx = local_idx_global(hulls_idx, n_per)
+    # Check if there are any duplicate surface indices
+    all_surface_indices = vcat(surface_particles_idx)
 
-if length(all_surface_indices) != length(unique(all_surface_indices))
-    @warn "Duplicate surface particle indices detected!"
-else
-    println("No duplicate surface particle indices.")
-end
-
-# -------- Setup bonding along droplet hulls --------
-# Setup harmonic bonds along the droplet surfaces (hulls)
-bond_is = Int[]
-bond_js = Int[]
-bond_params = Vector{HarmonicBond}()
-
-bend_is = Int[]
-bend_js = Int[]
-bend_params = Vector{HarmonicBond}()
-
-bend4_is = Int[]
-bend4_js = Int[]
-bend4_params = Vector{HarmonicBond}()
-
-if enable_God_bead 
-    God_bond_is = Int[]
-    God_bond_js = Int[]
-    God_bond_params = Vector{HarmonicBond}()
-end
-    
-for (k, droplet_range) in enumerate(droplet_ranges)
-    center_idx = droplet_range[1]  # God bead index is the first index inside the droplet
-    surface_particles = surface_particles_idx[k]
-    for i in 1:(length(surface_particles)-1)  # Exclude last which is a duplicate of the first
-
-        if enable_God_bead
-            r0 = norm(x0_oil[surface_particles[i]] - x0_oil[center_idx])
-            push!(God_bond_is, center_idx)
-            push!(God_bond_js, surface_particles[i])
-            push!(God_bond_params, HarmonicBond(k=bond_stiffness_god, r0=r0))
-        end
-
-        r0_neighor = norm(x0_oil[surface_particles[i]] - x0_oil[surface_particles[i+1]])
-        push!(bond_is, surface_particles[i])
-        push!(bond_js, surface_particles[i+1])
-        push!(bond_params, HarmonicBond(k=bond_stiffness_main, r0=r0_neighor))
-
-        ro_neighbor2 = norm(x0_oil[surface_particles[i]] - x0_oil[surface_particles[mod1(i+2, length(surface_particles)-1)]])
-        push!(bend_is, surface_particles[i])
-        push!(bend_js, surface_particles[mod1(i+2, length(surface_particles)-1)])
-        push!(bend_params, HarmonicBond(k=bond_stiffness_secondary, r0=ro_neighbor2))
-
-        ro_neighbor4 = norm(x0_oil[surface_particles[i]] - x0_oil[surface_particles[mod1(i+4, length(surface_particles)-1)]])
-        push!(bend4_is, surface_particles[i])
-        push!(bend4_js, surface_particles[mod1(i+4, length(surface_particles)-1)])
-        push!(bend4_params, HarmonicBond(k=bond_stiffness_fourth, r0=ro_neighbor4))
+    if length(all_surface_indices) != length(unique(all_surface_indices))
+        @warn "Duplicate surface particle indices detected!"
+    else
+        println("No duplicate surface particle indices.")
     end
-end
-standard = InteractionList2Atoms(bond_is, bond_js, bond_params)
-bend2 = InteractionList2Atoms(bend_is, bend_js, bend_params)
-bend4 = InteractionList2Atoms(bend4_is, bend4_js, bend4_params)
-if enable_God_bead
-    god_interactions = InteractionList2Atoms(God_bond_is, God_bond_js, God_bond_params)
-    specific_inter_lists = (standard, bend2, bend4, god_interactions, light_spring_interactions)# hull_angles) # Combine bond and angle lists
-else
-    specific_inter_lists = (standard, bend2, bend4, light_spring_interactions)# hull_angles) # Combine bond and angle lists
+
+#endregion
+#region -------- Setup bonding along droplet hulls --------
+
+    bond_is = Int[]
+    bond_js = Int[]
+    bond_params = Vector{HarmonicBond}()
+
+    bend_is = Int[]
+    bend_js = Int[]
+    bend_params = Vector{HarmonicBond}()
+
+    bend4_is = Int[]
+    bend4_js = Int[]
+    bend4_params = Vector{HarmonicBond}()
+
+    if enable_God_bead 
+        God_bond_is = Int[]
+        God_bond_js = Int[]
+        God_bond_params = Vector{HarmonicBond}()
+    end
+        
+    for (k, droplet_range) in enumerate(droplet_ranges)
+        center_idx = droplet_range[1]  # God bead index is the first index inside the droplet
+        surface_particles = surface_particles_idx[k]
+        for i in 1:(length(surface_particles)-1)  # Exclude last which is a duplicate of the first
+
+            if enable_God_bead
+                r0 = norm(x0_oil[surface_particles[i]] - x0_oil[center_idx])
+                push!(God_bond_is, center_idx)
+                push!(God_bond_js, surface_particles[i])
+                push!(God_bond_params, HarmonicBond(k=bond_stiffness_god, r0=r0))
+            end
+
+            r0_neighor = norm(x0_oil[surface_particles[i]] - x0_oil[surface_particles[i+1]])
+            push!(bond_is, surface_particles[i])
+            push!(bond_js, surface_particles[i+1])
+            push!(bond_params, HarmonicBond(k=bond_stiffness_main, r0=r0_neighor))
+
+            ro_neighbor2 = norm(x0_oil[surface_particles[i]] - x0_oil[surface_particles[mod1(i+2, length(surface_particles)-1)]])
+            push!(bend_is, surface_particles[i])
+            push!(bend_js, surface_particles[mod1(i+2, length(surface_particles)-1)])
+            push!(bend_params, HarmonicBond(k=bond_stiffness_secondary, r0=ro_neighbor2))
+
+            ro_neighbor4 = norm(x0_oil[surface_particles[i]] - x0_oil[surface_particles[mod1(i+4, length(surface_particles)-1)]])
+            push!(bend4_is, surface_particles[i])
+            push!(bend4_js, surface_particles[mod1(i+4, length(surface_particles)-1)])
+            push!(bend4_params, HarmonicBond(k=bond_stiffness_fourth, r0=ro_neighbor4))
+        end
+    end
+    standard = InteractionList2Atoms(bond_is, bond_js, bond_params)
+    bend2 = InteractionList2Atoms(bend_is, bend_js, bend_params)
+    bend4 = InteractionList2Atoms(bend4_is, bend4_js, bend4_params)
+    if enable_God_bead
+        god_interactions = InteractionList2Atoms(God_bond_is, God_bond_js, God_bond_params)
+        specific_inter_lists = (standard, bend2, bend4, god_interactions, light_spring_interactions)# hull_angles) # Combine bond and angle lists
+    else
+        specific_inter_lists = (standard, bend2, bend4)# hull_angles) # Combine bond and angle lists
+    end
+else 
+    specific_inter_lists
 end
 
 
-# ------- Shear profile setup --------
+
+#endregion
+#region -------- Shear profile setup --------
 shear_profile = make_shear_profile(gamma_fn = gamma_fn)
 
 # Precompute a reference shear rate over the simulation span to normalize drag strength.
@@ -276,8 +285,8 @@ rate_samples = [abs(shear_profile.gamma_rate(t)) for t in range(0, stop=T, lengt
 gamma_rate_ref = maximum(rate_samples)
 gamma_rate_ref = gamma_rate_ref <= eps(Float64) ? 1.0 : gamma_rate_ref
 
-
-# ------- Build the Molly system --------
+#endregion
+#region -------- Build the Molly system --------
 sys, wall_range = build_emulsion_system(
     x0_emulsion,
     walls,
@@ -294,8 +303,8 @@ sys, wall_range = build_emulsion_system(
     periodic_y=periodic_y_mode,
 )
 wall_indices = collect(wall_range)
-
-# -------- Energy and temperature logging setup --------
+#endregion
+#region -------- Energy and temperature logging setup --------
 energy_history = Float64[]
 time_history = Float64[]
 temperature_history = Float64[]
@@ -309,8 +318,8 @@ end
 temp0 = current_temperature(sys, n_bulk)  # proxy temperature (k_B=1)
 push!(temperature_history, temp0)
 push!(temperature_time, 0.0)
-
-# ------- Setup pre_step! and post_step! functions --------
+#endregion
+#region -------- Setup pre_step! and post_step! functions --------
 pre_wall! = isempty(wall_indices) ? nothing : (step_idx -> begin
     t = step_idx == 0 ? 0.0 : (step_idx - 1) * dt
     enforce_wall_motion!(sys, wall_indices, wall_bases, wall_sides, shear_profile, t, wall_gap, box_side)
@@ -318,12 +327,14 @@ end)
 
 post_wall! = isempty(wall_indices) ?
     (step_idx -> begin 
-        # No moving walls; still keep droplets intact (soft hull)
-        apply_soft_hull_wall!(
-            sys, droplet_ranges, box_side;
-            hulls_idx = hulls_idx, dt = dt,
-            k_wall = bond_stiffness_main, buffer = 0.5 * cutoff
-        )
+        if enable_hulls
+            # No moving walls; still keep droplets intact (soft hull)
+            apply_soft_hull_wall!(
+                sys, droplet_ranges, box_side;
+                hulls_idx = hulls_idx, dt = dt,
+                k_wall = bond_stiffness_main, buffer = 0.5 * cutoff
+            )
+        end
     end) :
    (step_idx -> begin
     t = step_idx * dt
@@ -331,12 +342,15 @@ post_wall! = isempty(wall_indices) ?
     apply_wall_drag!(sys, n_bulk, wall_y_top_ref, wall_y_bot_ref, shear_profile, t, wall_gap, box_side,
                      dt=dt, rate_ref=gamma_rate_ref)
     confine_bulk_y!(sys, n_bulk, wall_y_bot_ref + cutoff, wall_y_top_ref - cutoff)
-    # Soft hull wall to keep droplets intact but deformable
-    apply_soft_hull_wall!(
-        sys, droplet_ranges, box_side;
-        hulls_idx = hulls_idx, dt = dt,
-        k_wall = bond_stiffness_main, buffer = 0.5 * cutoff/1.5
-    )
+    if enable_hulls
+        # Soft hull wall to keep droplets intact but deformable
+        apply_soft_hull_wall!(
+            sys, droplet_ranges, box_side;
+            hulls_idx = hulls_idx, dt = dt,
+            k_wall = bond_stiffness_main, buffer = 0.5 * cutoff/1.5
+        )
+    end
+
     if enable_energy_logging && (step_idx % save_every == 0 || step_idx == nsteps)
         Etot, _, _ = emulsion_energy(sys, cutoff, box_side; n_bulk_only=n_bulk)
         push!(energy_history, Etot)
@@ -352,12 +366,14 @@ post_wall! = isempty(wall_indices) ?
 # Periodic-y hook (used when walls are disabled).
 post_periodic! = periodic_y_mode ? (step_idx -> begin
     apply_periodic_y!(sys, n_bulk, box_side)
-    # No moving walls; still keep droplets intact (soft hull)
-    apply_soft_hull_wall!(
-        sys, droplet_ranges, box_side;
-        hulls_idx = hulls_idx, dt = dt,
-        k_wall = bond_stiffness_main, buffer = 0.5 * cutoff
+    if enable_hulls
+        # No moving walls; still keep droplets intact (soft hull)
+        apply_soft_hull_wall!(
+            sys, droplet_ranges, box_side;
+            hulls_idx = hulls_idx, dt = dt,
+            k_wall = bond_stiffness_main, buffer = 0.5 * cutoff
     )
+    end
     if enable_energy_logging && (step_idx % save_every == 0 || step_idx == nsteps)
         Etot, _, _ = emulsion_energy(sys, cutoff, box_side; n_bulk_only=n_bulk)
         push!(energy_history, Etot)
@@ -372,8 +388,8 @@ end) : nothing
 
 pre_hook  = periodic_y_mode ? nothing       : pre_wall!
 post_hook = periodic_y_mode ? post_periodic! : post_wall!
-
-# ------- Run the simulation and collect coordinates -------- 
+#endregion
+#region -------- Run the simulation and collect coordinates -------- 
 simulator = enable_langevin ?
     Langevin(dt = dt, temperature = temperature, friction = gamma_langevin) :
     VelocityVerlet(dt = dt)
@@ -400,8 +416,8 @@ println("Simulation completed in $sim_time seconds.")
 if isempty(coords_history) || isempty(coords_history[1])
     error("No particle coordinates recorded; check system initialization.")
 end
-
-# ------- Visualization --------
+#endregion
+#region -------- Visualization --------
 # color each droplet differently 
 droplet_colors = [RGB(rand(), rand(), rand()) for _ in 1:length(n_per)]
 oil_colors = vcat([fill(droplet_colors[k], n_per[k]) for k in 1:length(n_per)]...)
@@ -435,18 +451,31 @@ isdir(outdir) || mkpath(outdir) # Create directory if it doesn't exist
 fname = "wall_emulsion_harmonic_dt$(dt)_ow$(a_oil_water)_ww$(a_water_water)_so$(a_surface_oil)_ss$(a_surface_surface)_$(n_droplets)_T$(T)_vol$(volume_fraction_oil)_sc$(surface_concentration).mp4"
 outfile = joinpath(outdir, fname)
 
-visualize_with_progress(
-    coords_history_wrapped,
-    sys.boundary,
-    outfile;
-    color = colors,
-    markersize = 1.0,
-    framerate = fps,
-    droplet_ranges = droplet_ranges,
-    box_side = box_side,
-    hulls_idx = hulls_idx,
-    droplet_colors = droplet_colors,
-)
+if enable_hulls
+    visualize_with_progress(
+        coords_history_wrapped,
+        sys.boundary,
+        outfile;
+        color = colors,
+        markersize = 1.0,
+        framerate = fps,
+        droplet_ranges = droplet_ranges,
+        box_side = box_side,
+        hulls_idx = hulls_idx,
+        droplet_colors = droplet_colors,
+    )
+else
+    visualize_with_progress(
+        coords_history_wrapped,
+        sys.boundary,
+        outfile;
+        color = colors,
+        markersize = 1.0,
+        framerate = fps,
+        box_side = box_side,
+        droplet_colors = droplet_colors,
+    )
+end
 println("Visualization saved to ", outfile)
 
 # Plot energy vs time
@@ -468,8 +497,8 @@ if !isempty(temperature_history)
     GLMakie.save(temp_outfile, figT)
     println("Saved temperature plot to ", temp_outfile)
 end
-
-# --------------Cluster analysis on snapshot --------------
+#endregion
+#region -------- Cluster analysis on snapshot --------
 # -----------------------
 # Take snapshot at a chosen physical time
 # -----------------------
@@ -534,3 +563,4 @@ println("Clusters: ", n_clusters,
         " | beads per cluster: ", beads_per_cluster)
 
 println("Average effective radius: ", avg_radius)
+#endregion
