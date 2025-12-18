@@ -115,3 +115,30 @@ function emulsion_energy(sys::Molly.System, cutoff::Float64, box_side::Float64; 
 
     return E_kin + E_pot, E_kin, E_pot
 end
+
+# Total energy (kinetic + potential) using the same interaction as the force.
+function emulsion_soft_energy(sys::Molly.System, cutoff::Float64, box_side::Float64; n_bulk_only::Union{Nothing,Int}=nothing)
+    N = n_bulk_only === nothing ? length(sys.coords) : n_bulk_only
+
+    E_kin = 0.0
+    @inbounds for i in 1:N
+        E_kin += 0.5 * sys.atoms[i].mass * sum(abs2, sys.velocities[i])
+    end
+
+    E_pot = 0.0
+    @inbounds for i in 1:N-1
+        ti = sys.atoms[i].atom_type
+        xi = sys.coords[i]
+        for j in i+1:N
+            tj = sys.atoms[j].atom_type
+            dx = wrap_x(sys.coords[j][1] - xi[1], box_side)
+            dy_raw = sys.coords[j][2] - xi[2]
+            dy = periodic_y_mode ? wrap_delta(dy_raw, box_side) : dy_raw
+            r = sqrt(dx*dx + dy*dy)
+            _, U = potential_energy(sys.pairwise_inters[1], r, sys.atoms[i],sys.atoms[j], Unitful.NoUnits)
+            E_pot += U
+        end
+    end
+
+    return E_kin + E_pot, E_kin, E_pot
+end

@@ -196,10 +196,12 @@ function visualize_soft_spheres_with_progress(
     coords_history::Vector{Vector{SVector{2,Float64}}},
     boundary::Molly.RectangularBoundary,
     outfile::String;
-    markersize::Real=6.0,
     framerate::Integer=30,
     box_side::Float64,
     droplet_radius::Float64,
+    n_droplets::Int,
+    wall_radius::Float64 = 1.0,
+    n_walls::Int = 0,
 )
     frames = length(coords_history)
 
@@ -234,11 +236,10 @@ function visualize_soft_spheres_with_progress(
     N = length(first_frame)
     xs = GLMakie.Observable([first_frame[i][1] for i in 1:N])
     ys = GLMakie.Observable([first_frame[i][2] for i in 1:N])
-    msizes = [markersize for i in 1:N]
-    diameter = 2*droplet_radius
+    msizes = [i<= n_droplets ? 2*droplet_radius : 2*wall_radius for i in 1:N]
+    color = [i<= n_droplets ? RGB(0.2, 0.6, 1.0) : RGB(0.5, 0.5, 0.5) for i in 1:N]
     
-    
-    GLMakie.scatter!(ax, xs, ys; markerspace = :data, markersize=diameter)
+    GLMakie.scatter!(ax, xs, ys; markerspace = :data, markersize=msizes, color=color)
 
     # Progress for rendering
     local progress = nothing

@@ -143,3 +143,86 @@ function build_emulsion_system(x0_bulk::Vector{SVector{2,Float64}},
     )
     return sys, wall_range
 end
+
+function build_soft_emulsion_system(x0_bulk::Vector{SVector{2,Float64}},
+                               x0_walls::Vector{SVector{2,Float64}},
+                               atoms_oil::Vector{Atom{Int64, Float64, Float64, Float64, Float64}},
+                               atoms_walls::Vector{Atom{Int64, Float64, Float64, Float64, Float64}},
+                               box_side::Float64, cutoff::Float64,
+                               bulk_velocities::Vector{SVector{2,Float64}},
+                               wall_velocities::Vector{SVector{2,Float64}},
+                               pairwise_inter,
+                               nsteps::Integer; periodic_y::Bool=false, n_threashold::Float64=0.3)
+
+    n_bulk_local = length(x0_bulk)
+    n_walls = length(x0_walls)
+    n_total = n_bulk_local + n_walls
+    wall_range = n_walls == 0 ? (0:-1) : ((n_bulk_local+1):n_total)
+
+    # Molly.RectangularBoundary does not accept per-dimension periodic flags; use the
+    # standard constructor (periodic in all dimensions) and handle x wrapping manually
+    # for wall motion via wrap_x.
+    # Periodic in x; standard span in y (we ignore y wrapping in force calculation).
+    y_span = box_side
+    boundary = Molly.RectangularBoundary(SVector{2,Float64}(box_side, y_span))
+    
+    atoms = n_walls!=0 ? vcat(atoms_oil, atoms_walls) : atoms_oil
+    coords_all = n_walls!=0 ? vcat(x0_bulk, x0_walls) : x0_bulk
+    velocities = n_walls!=0 ? vcat(bulk_velocities, wall_velocities) : bulk_velocities
+
+    
+    # eligible = falses(n_total, n_total)
+    # eligible[1:n_bulk_local, 1:n_bulk_local] = cluster_matrix
+    eligible = trues(n_total, n_total)
+    # Disable self-interactions
+    @inbounds for i in 1:n_total
+        eligible[i,i] = false
+    end
+    
+    if n_walls > 0
+        eligible[wall_range, wall_range] .= false  # keep rough wall beads rigid relative to each other
+        eligible[1:n_bulk_local, wall_range] .= false  # disable bulk-wall interactions
+        eligible[wall_range, 1:n_bulk_local] .= false  # disable bulk-wall interactions
+    end
+
+    if atoms_oil[1].σ > n_threashold
+        println("Skipping neighbor list for soft spheres with large σ=$(atoms_oil[1].σ)")
+        # Build Molly system that will be solved by a simulator
+        sys = Molly.System(
+            atoms = atoms,
+            coords = coords_all,
+            boundary = boundary,
+            velocities = velocities,
+            pairwise_inters = pairwise_inter,
+            loggers = (coords=MyCoordinatesLogger(nsteps, dims=2),),
+            energy_units = Unitful.NoUnits,
+            force_units = Unitful.NoUnits
+        )
+    else
+
+        cellListMap_finder = Molly.CellListMapNeighborFinder(
+                                eligible=eligible,
+                                dist_cutoff=cutoff,
+                                x0=coords_all,
+                                unit_cell = boundary,
+                                n_steps = 5, # update neighbors more often so moving walls stay accurate
+                                dims = 2,
+                            )
+
+        # Build Molly system that will be solved by a simulator
+        sys = Molly.System(
+            atoms = atoms,
+            coords = coords_all,
+            boundary = boundary,
+            velocities = velocities,
+            pairwise_inters = pairwise_inter,
+            neighbor_finder = cellListMap_finder,
+            loggers = (coords=MyCoordinatesLogger(nsteps, dims=2),),
+            energy_units = Unitful.NoUnits,
+            force_units = Unitful.NoUnits
+        )
+    end
+
+    
+    return sys, wall_range
+end
