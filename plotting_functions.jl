@@ -7,7 +7,7 @@ function visualize_with_progress(
     framerate::Integer=30,
     droplet_ranges::Vector{UnitRange{Int}},
     box_side::Float64,
-    hulls_idx::Vector{Vector{Int}} = Vector{Vector{Int}}[],
+    hulls_idx::Union{Nothing, Vector{Vector{Int}}} = nothing,
     droplet_colors::Vector{RGB{Float64}},
 )
     frames = length(coords_history)
@@ -56,23 +56,31 @@ function visualize_with_progress(
     end
     GLMakie.scatter!(ax, xs, ys; color=mcolors, markersize=msizes)
 
-    # Hull line observables per droplet
-    n_drops = length(droplet_ranges)
-    hull_pts_obs = [GLMakie.Observable(GLMakie.Point2f[]) for _ in 1:n_drops]
 
-    # Pre-create lines for each droplet, colored with droplet_colors
-    for k in 1:n_drops
-        GLMakie.lines!(ax, hull_pts_obs[k]; color=droplet_colors[k], linewidth=2);
+    n_drops = length(droplet_ranges)
+
+    plot_hulls = hulls_idx !== nothing
+
+    hull_pts_obs =[GLMakie.Observable(GLMakie.Point2f[]) for _ in 1:n_drops] 
+
+    if plot_hulls
+        @assert length(hulls_idx) == n_drops "hulls_idx must match droplet_ranges"
+        for k in 1:n_drops
+            GLMakie.lines!(ax, hull_pts_obs[k];
+                color = droplet_colors[k],
+                linewidth = 2
+            )
+        end
     end
 
     # Progress for rendering
-    local p = nothing
+    local progress = nothing
     if HAS_PROGRESSMETER[]
-        p = ProgressMeter.Progress(frames; desc="Rendering", dt=0.2)
+        progress = ProgressMeter.Progress(frames; desc="Rendering", dt=0.2)
     end
 
     # Helper: compute hull ring coords for a droplet within a frame
-    compute_hull_coords = function(frame::Vector{SVector{2,Float64}}, dr::UnitRange{Int}, hull_indx::Vector{Int}=hulls_idx[1])
+    compute_hull_coords = function(frame::Vector{SVector{2,Float64}}, dr::UnitRange{Int}, hull_indx::Vector{Int})
         pts = frame[dr]
         length(pts) < 3 && return GLMakie.Point2f[]
         # Local x wrap around mean
@@ -110,15 +118,15 @@ function visualize_with_progress(
         end
         GLMakie.notify(xs); GLMakie.notify(ys)
 
-        # Update each droplet hull
-        for (idx, dr) in enumerate(droplet_ranges)
-            pts_h = compute_hull_coords(ci, dr, hulls_idx[idx])
-            hull_pts_obs[idx][] = pts_h
-            GLMakie.notify(hull_pts_obs[idx])
+        if plot_hulls
+            for (idx, dr) in enumerate(droplet_ranges)
+                pts_h = compute_hull_coords(ci, dr, hulls_idx[idx])
+                hull_pts_obs[idx][] = pts_h
+                GLMakie.notify(hull_pts_obs[idx])
+            end
         end
-
-        if p !== nothing
-            ProgressMeter.next!(p)
+        if progress !== nothing
+            ProgressMeter.next!(progress)
         end
     end
 end
@@ -182,4 +190,74 @@ function plot_hull_points(x0_oil::Vector{SVector{2,T}},
     axislegend(ax; position=:lt)
     
     return fig
+end
+
+function visualize_soft_spheres_with_progress(
+    coords_history::Vector{Vector{SVector{2,Float64}}},
+    boundary::Molly.RectangularBoundary,
+    outfile::String;
+    markersize::Real=6.0,
+    framerate::Integer=30,
+    box_side::Float64,
+    droplet_radius::Float64,
+)
+    frames = length(coords_history)
+
+    isempty(coords_history) && error("No coordinates recorded; nothing to visualize.")
+
+    # Axis limits from full trajectory (as before)
+    xmin = Inf; xmax = -Inf; ymin = Inf; ymax = -Inf
+    for frame in coords_history
+        for p in frame
+            x = p[1]; y = p[2]
+            if isfinite(x) && isfinite(y)
+                xmin = min(xmin, x); xmax = max(xmax, x)
+                ymin = min(ymin, y); ymax = max(ymax, y)
+            end
+        end
+    end
+    if !isfinite(xmin) || !isfinite(ymin)
+        error("Coordinates contain no finite values; cannot visualize trajectory.")
+    end
+    span_x = xmax - xmin
+    span_y = ymax - ymin
+    pad = 0.1 * max(max(span_x, span_y), 1.0)
+
+    fig = GLMakie.Figure(size=(800,800))
+    ax = GLMakie.Axis(fig[1,1];
+        limits = (xmin - pad, xmax + pad, ymin - pad, ymax + pad),
+        aspect = GLMakie.DataAspect(),
+    )
+
+    # Scatter setup (as before)
+    first_frame = coords_history[1]
+    N = length(first_frame)
+    xs = GLMakie.Observable([first_frame[i][1] for i in 1:N])
+    ys = GLMakie.Observable([first_frame[i][2] for i in 1:N])
+    msizes = [markersize for i in 1:N]
+    diameter = 2*droplet_radius
+    
+    
+    GLMakie.scatter!(ax, xs, ys; markerspace = :data, markersize=diameter)
+
+    # Progress for rendering
+    local progress = nothing
+    if HAS_PROGRESSMETER[]
+        progress = ProgressMeter.Progress(frames; desc="Rendering", dt=0.2)
+    end
+
+    
+
+    GLMakie.record(fig, outfile, 1:frames; framerate=framerate) do i
+        ci = coords_history[i]
+        @inbounds for k in 1:N
+            xs[][k] = ci[k][1]
+            ys[][k] = ci[k][2]
+        end
+        GLMakie.notify(xs); GLMakie.notify(ys)
+
+        if progress !== nothing
+            ProgressMeter.next!(progress)
+        end
+    end
 end

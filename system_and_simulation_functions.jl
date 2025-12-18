@@ -1,12 +1,12 @@
 # Custom logger to record coordinates without units (taken from Molly source code)
-function MyCoordinatesLogger(T, n_steps::Integer; dims::Integer=3)
+function MyCoordinatesLogger(T, n_steps::Integer; dims::Integer=2)
     return Molly.GeneralObservableLogger(
         Molly.coordinates_wrapper,
         Array{SArray{Tuple{dims}, T, 1, dims}, 1},
         n_steps,
     )
 end
-MyCoordinatesLogger(n_steps::Integer; dims::Integer=3) = MyCoordinatesLogger(Float64, n_steps; dims=dims)
+MyCoordinatesLogger(n_steps::Integer; dims::Integer=2) = MyCoordinatesLogger(Float64, n_steps; dims=dims)
 
 # Fallback manual trajectory collector with subsampling by save_every
 # Saves the initial frame, then every save_every steps, and always the final frame.
