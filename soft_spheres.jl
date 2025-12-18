@@ -36,10 +36,10 @@ temperature         = 273                   # temp in kelvin
 
 # ------------- Droplet settings ------------
 #n_droplets = 20               # number of droplets is now based on volume fraction and droplet size
-droplet_radius     = 0.5 
+droplet_radius     = 0.1 
 droplet_mass       = 100.0
 energy_strength    = 0.00001
-#cutoff             = 5*droplet_radius    # cutoff is disabled because the number of droplets is small (so there is no need to use neoighbors list)
+cutoff             = 5*droplet_radius    # cutoff is disabled for droplet_radius>0.3 because then the number of droplets is small (so there is no need to use neoighbors list)
 minimal_dist_frac  = 0.5                  # minimal distance between initial droplet centers as fraction of 2*R
 
 # ------------ Simulation settings ----------
@@ -68,8 +68,12 @@ droplets = [Atom(mass=droplet_mass, σ=2*droplet_radius, ϵ=energy_strength) for
 boundary = Molly.RectangularBoundary(SVector{2,Float64}(box_side, box_side))
 init_coord = Molly.place_atoms(n_droplets, boundary, min_dist=2.0*droplet_radius*minimal_dist_frac)
 v0_bulk = [random_velocity(droplet_mass, temperature; dims=2) for _ in 1:n_droplets]
-pairwise_inter = (Molly.SoftSphere(use_neighbors=false),)
 
+if droplet_radius > 0.3
+    pairwise_inter = (Molly.SoftSphere(use_neighbors=false),)
+else
+    pairwise_inter = (Molly.SoftSphere(cutoff=Molly.DistanceCutoff(cutoff), use_neighbors=true),)
+end
 #endregion
 #region ------- Plot the force function -----
 rs = range(0.1*droplet_radius, 4*droplet_radius, length=500) # Distance range 
@@ -119,17 +123,40 @@ save(joinpath(outdir, "soft_sphere_force_plot.png"), fig)
 println("Force plot saved as 'soft_sphere_force_plot.png'.")
 #endregion
 #region ------- Build the system and run simulation -----
-sys = System(
-    atoms = droplets,
-    coords = init_coord,
-    velocities = v0_bulk,
-    boundary = boundary,
-    pairwise_inters= pairwise_inter,
-    loggers = (coords=MyCoordinatesLogger(1, dims=2),),
-    energy_units = Unitful.NoUnits,
-    force_units = Unitful.NoUnits
-)
+if droplet_radius > 0.3
+  
 
+    sys = System(
+        atoms = droplets,
+        coords = init_coord,
+        velocities = v0_bulk,
+        boundary = boundary,
+        pairwise_inters= pairwise_inter,
+        loggers = (coords=MyCoordinatesLogger(1, dims=2),),
+        energy_units = Unitful.NoUnits,
+        force_units = Unitful.NoUnits
+    )
+else
+    cellListMap_finder = Molly.CellListMapNeighborFinder(
+        eligible=trues(n_droplets, n_droplets),
+        dist_cutoff=cutoff,
+        x0=init_coord,
+        unit_cell = boundary,
+        n_steps = 5, # update neighbors more often so moving walls stay accurate
+        dims = 2,
+    )
+    sys = System(
+        atoms = droplets,
+        coords = init_coord,
+        velocities = v0_bulk,
+        boundary = boundary,
+        pairwise_inters= pairwise_inter,
+        neighbor_finder = cellListMap_finder,
+        loggers = (coords=MyCoordinatesLogger(1, dims=2),),
+        energy_units = Unitful.NoUnits,
+        force_units = Unitful.NoUnits
+    )
+end
 simulator = VelocityVerlet(dt = dt,coupling = Molly.AndersenThermostat(temperature,1.0))
 
 sim_time = @elapsed begin
