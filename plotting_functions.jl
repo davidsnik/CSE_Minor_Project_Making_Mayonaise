@@ -262,3 +262,79 @@ function visualize_soft_spheres_with_progress(
         end
     end
 end
+
+function visualize_soft_spheres_with__artificial_wall(
+    coords_history::Vector{Vector{SVector{2,Float64}}},
+    boundary::Molly.RectangularBoundary,
+    outfile::String;
+    framerate::Integer=30,
+    box_side::Float64,
+    droplet_radius::Float64,
+    n_droplets::Int,
+)
+    frames = length(coords_history)
+
+    isempty(coords_history) && error("No coordinates recorded; nothing to visualize.")
+
+    # Axis limits from full trajectory (as before)
+    xmin = Inf; xmax = -Inf; ymin = Inf; ymax = -Inf
+    for frame in coords_history
+        for p in frame
+            x = p[1]; y = p[2]
+            if isfinite(x) && isfinite(y)
+                xmin = min(xmin, x); xmax = max(xmax, x)
+                ymin = min(ymin, y); ymax = max(ymax, y)
+            end
+        end
+    end
+    if !isfinite(xmin) || !isfinite(ymin)
+        error("Coordinates contain no finite values; cannot visualize trajectory.")
+    end
+    
+
+    span_x = xmax - xmin
+    span_y = ymax - ymin
+    pad = 0.1 * max(max(span_x, span_y), 1.0)
+
+    fig = GLMakie.Figure(size=(800,800))
+    ax = GLMakie.Axis(fig[1,1];
+        limits = (xmin - pad, xmax + pad, ymin - pad, ymax + pad),
+        aspect = GLMakie.DataAspect(),
+    )
+
+
+    # Draw two thin gray horizontal lines at y = box_side/2 and y = -box_side/2 spanning all x positions
+    GLMakie.lines!(ax, [xmin, xmax], [box_side, box_side]; color=:gray, linewidth=10)
+    GLMakie.lines!(ax, [xmin, xmax], [0, 0]; color=:gray, linewidth=10)
+
+    # Scatter setup (as before)
+    first_frame = coords_history[1]
+    N = length(first_frame)
+    xs = GLMakie.Observable([first_frame[i][1] for i in 1:N])
+    ys = GLMakie.Observable([first_frame[i][2] for i in 1:N])
+    msizes = [2*droplet_radius for i in 1:N]
+    color = [RGB(0.2, 0.6, 1.0) for i in 1:N]
+    
+    GLMakie.scatter!(ax, xs, ys; markerspace = :data, markersize=msizes, color=color)
+
+    # Progress for rendering
+    local progress = nothing
+    if HAS_PROGRESSMETER[]
+        progress = ProgressMeter.Progress(frames; desc="Rendering", dt=0.2)
+    end
+
+    
+
+    GLMakie.record(fig, outfile, 1:frames; framerate=framerate) do i
+        ci = coords_history[i]
+        @inbounds for k in 1:N
+            xs[][k] = ci[k][1]
+            ys[][k] = ci[k][2]
+        end
+        GLMakie.notify(xs); GLMakie.notify(ys)
+
+        if progress !== nothing
+            ProgressMeter.next!(progress)
+        end
+    end
+end

@@ -226,3 +226,71 @@ function build_soft_emulsion_system(x0_bulk::Vector{SVector{2,Float64}},
     
     return sys, wall_range
 end
+
+function build_soft_emulsion_system_with_artificial_walls(coords_all::Vector{SVector{2,Float64}},
+                               atoms::Vector{Atom{Int64, Float64, Float64, Float64, Float64}},
+                               box_side::Float64, 
+                               cutoff::Float64,
+                               velocities::Vector{SVector{2,Float64}},
+                               pairwise_inter,
+                               wall_interactions,
+                               nsteps::Integer; 
+                               n_threashold::Float64=0.3)
+
+    n_bulk_local = length(coords_all)
+   
+    boundary = Molly.RectangularBoundary(SVector{2,Float64}(box_side, box_side))
+    
+    
+    # eligible = falses(n_total, n_total)
+    # eligible[1:n_bulk_local, 1:n_bulk_local] = cluster_matrix
+    eligible = trues(n_bulk_local, n_bulk_local)
+    # Disable self-interactions
+    @inbounds for i in 1:n_bulk_local
+        eligible[i,i] = false
+    end
+    
+
+    if atoms[1].σ > n_threashold
+        println("Skipping neighbor list for soft spheres with large σ=$(atoms[1].σ)")
+        # Build Molly system that will be solved by a simulator
+        sys = Molly.System(
+            atoms = atoms,
+            coords = coords_all,
+            boundary = boundary,
+            velocities = velocities,
+            pairwise_inters = pairwise_inter,
+            general_inters = wall_interactions,
+            loggers = (coords=MyCoordinatesLogger(nsteps, dims=2),),
+            energy_units = Unitful.NoUnits,
+            force_units = Unitful.NoUnits
+        )
+    else
+
+        cellListMap_finder = Molly.CellListMapNeighborFinder(
+                                eligible=eligible,
+                                dist_cutoff=cutoff,
+                                x0=coords_all,
+                                unit_cell = boundary,
+                                n_steps = 5, # update neighbors more often so moving walls stay accurate
+                                dims = 2,
+                            )
+
+        # Build Molly system that will be solved by a simulator
+        sys = Molly.System(
+            atoms = atoms,
+            coords = coords_all,
+            boundary = boundary,
+            velocities = velocities,
+            pairwise_inters = pairwise_inter,
+            general_inters = wall_interactions,
+            neighbor_finder = cellListMap_finder,
+            loggers = (coords=MyCoordinatesLogger(nsteps, dims=2),),
+            energy_units = Unitful.NoUnits,
+            force_units = Unitful.NoUnits
+        )
+    end
+
+    
+    return sys
+end

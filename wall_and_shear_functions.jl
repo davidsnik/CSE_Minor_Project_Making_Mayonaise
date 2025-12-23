@@ -186,3 +186,54 @@ function enforce_wall_motion!(sys::Molly.System,
         sys.velocities[idx] = SVector(speed, 0.0)
     end
 end
+
+struct SoftsphereWall 
+    y_position::Float64  # Location of the wall (e.g., 0.0)
+    σ::Float64           # Interaction radius
+    ϵ::Float64           # Interaction strength
+    cutoff::Float64      # Distance at which to ignore the wall
+end
+
+import AtomsCalculators
+function AtomsCalculators.forces!(fs, sys::System,  inter::SoftsphereWall; kwargs...)
+    # Prepare an array of forces (zeros)
+    forces = zeros(typeof(sys.coords[1]), length(sys))
+    
+    for i in 1:length(sys)
+        # Calculate distance from the wall (assuming wall is at y_position)
+        # We only care about the y-component
+        dy = sys.coords[i][2] - inter.y_position
+        
+        # Check if atom is within cutoff (and on the correct side of the wall)
+        if 0 < dy < inter.cutoff
+            σ = inter.σ
+            ϵ = inter.ϵ
+            
+            # Your Math (Optimized)
+            # (σ / y)^12 term
+            term_ratio = (σ / dy)
+            term_12 = term_ratio^12
+            
+            # Force magnitude: 48 * ε * (1/y) * (σ/y)^12
+            f_mag = (48 * ϵ / dy) * term_12
+            
+            # Apply force in positive Y direction (repulsion away from wall)
+            # We add to the y-component of the force vector
+            fs[i] += SVector(0.0, f_mag)
+        end
+    end
+    return fs
+end
+
+function AtomsCalculators.potential_energy(sys::System, inter::SoftsphereWall; neighbors=nothing, step_n = 0, n_threads =1)
+    pe = 0.0
+    for i in 1:length(sys)
+        dy = sys.coords[i][2] - inter.y_position
+        
+        if 0 < dy < inter.cutoff
+            term_ratio = (inter.σ / dy)
+            pe += 4 * inter.ϵ * (term_ratio^12)
+        end
+    end
+    return pe
+end
