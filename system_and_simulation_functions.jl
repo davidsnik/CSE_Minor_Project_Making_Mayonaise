@@ -239,6 +239,7 @@ function build_soft_emulsion_system_with_artificial_walls(coords_all::Vector{SVe
 
     n_bulk_local = length(coords_all)
    
+    # Molly's RectangularBoundary does not accept a periodic keyword; non-periodic y is enforced by wall interactions.
     boundary = Molly.RectangularBoundary(SVector{2,Float64}(box_side, box_side))
     
     
@@ -251,45 +252,18 @@ function build_soft_emulsion_system_with_artificial_walls(coords_all::Vector{SVe
     end
     
 
-    if atoms[1].σ > n_threashold
-        println("Skipping neighbor list for soft spheres with large σ=$(atoms[1].σ)")
-        # Build Molly system that will be solved by a simulator
-        sys = Molly.System(
-            atoms = atoms,
-            coords = coords_all,
-            boundary = boundary,
-            velocities = velocities,
-            pairwise_inters = pairwise_inter,
-            general_inters = wall_interactions,
-            loggers = (coords=MyCoordinatesLogger(nsteps, dims=2),),
-            energy_units = Unitful.NoUnits,
-            force_units = Unitful.NoUnits
-        )
-    else
-
-        cellListMap_finder = Molly.CellListMapNeighborFinder(
-                                eligible=eligible,
-                                dist_cutoff=cutoff,
-                                x0=coords_all,
-                                unit_cell = boundary,
-                                n_steps = 5, # update neighbors more often so moving walls stay accurate
-                                dims = 2,
-                            )
-
-        # Build Molly system that will be solved by a simulator
-        sys = Molly.System(
-            atoms = atoms,
-            coords = coords_all,
-            boundary = boundary,
-            velocities = velocities,
-            pairwise_inters = pairwise_inter,
-            general_inters = wall_interactions,
-            neighbor_finder = cellListMap_finder,
-            loggers = (coords=MyCoordinatesLogger(nsteps, dims=2),),
-            energy_units = Unitful.NoUnits,
-            force_units = Unitful.NoUnits
-        )
-    end
+    # Build Molly system without neighbor list to avoid CellListMap issues for this small system.
+    sys = Molly.System(
+        atoms = atoms,
+        coords = coords_all,
+        boundary = boundary,
+        velocities = velocities,
+        pairwise_inters = pairwise_inter,
+        general_inters = wall_interactions,
+        loggers = (coords=MyCoordinatesLogger(nsteps, dims=2),),
+        energy_units = Unitful.NoUnits,
+        force_units = Unitful.NoUnits
+    )
 
     
     return sys

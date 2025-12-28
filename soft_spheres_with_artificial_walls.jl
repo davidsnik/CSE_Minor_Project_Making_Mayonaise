@@ -51,14 +51,14 @@ Random.seed!(1234)
 # -------- General system parameters --------
 volume_fraction_oil = 0.3                  
 box_side            = 5.0
-temperature         = 273                   # temp in kelvin
+temperature         = 1.0                   # reduced temp to limit initial speeds
 
 # ------------- Droplet settings ------------
 #n_droplets = 20               # number of droplets is now based on volume fraction and droplet size
 droplet_radius     = 0.1
 droplet_mass       = 1.0
 energy_strength    = 1.0
-cutoff             = 5*droplet_radius    # cutoff is disabled for droplet_radius>0.3 because then the number of droplets is small (so there is no need to use neoighbors list)
+cutoff             = 2.5*droplet_radius    # use a modest LJ/soft-sphere cutoff ~2.5 sigma
 minimal_dist_frac  = 1                  # minimal distance between initial droplet centers as fraction of 2*R
 skipping_neighbors_threshold = 0.3  # if droplet diameter is larger than this, skip neighbor list in Molly system
 # -------------- Wall settings --------------
@@ -66,8 +66,8 @@ skipping_neighbors_threshold = 0.3  # if droplet diameter is larger than this, s
 enable_walls = true             # set false to disable walls and use periodic y instead
 periodic_y_mode = !enable_walls
 wall_mass      = 10*droplet_mass
-wall_radius    = 0.001 * droplet_radius
-wall_energy_strength = 1 * energy_strength
+wall_radius    = 1.0 * droplet_radius     # give walls a sensible size to avoid singular kicks
+wall_energy_strength = 0.5 * energy_strength  # moderate wall interaction
 
 # Time-dependent shear strain gamma(t). Supply any lambda you like here; gammȧ(t)
 # is approximated numerically inside make_shear_profile.
@@ -79,12 +79,12 @@ gamma_fn = t -> gamma_amplitude * sin(2*pi*shear_freq*t + gamma_phase)
 # ------------ Simulation settings ----------
 enable_energy_logging = true     # set false to skip energy calc/logging for speed
 enable_langevin = true          # thermostat toggle
-gamma_langevin = 5.5             # friction coefficient for Langevin thermostat
-dt = 0.00000001
-T = 100000000*dt                              # CHANGE TIME HERE
+gamma_langevin = 0.5             # friction coefficient for Langevin thermostat
+dt = 1e-5
+T = 10.0                              # CHANGE TIME HERE
 nsteps = Int(round(T/dt))
 # Desired output fps; we will subsample to approximate this while keeping duration = T
-desired_fps = 500
+desired_fps = 60
 realistic_time = false          # if true, the video plays in real time and desired fps is disregarded; if false, output fps matches desired fps 
 output_folder = "soft_spheres_mp4" # folder to save visualization output (mp4, temp plot, energy plot)
 #endregion
@@ -104,32 +104,47 @@ println("Real volume fraction of oil: ", (n_droplets * droplet_area) / box_side^
 
 
 droplets = [Molly.Atom(mass=droplet_mass, σ=2*droplet_radius, ϵ=energy_strength, atom_type=1) for _ in 1:n_droplets]
+# Boundary for placement; Molly's RectangularBoundary here is periodic flag-less. Non-periodic y is handled by walls.
 boundary = Molly.RectangularBoundary(SVector{2,Float64}(box_side, box_side))
-init_coord = Molly.place_atoms(n_droplets, boundary, min_dist=2.0*droplet_radius*minimal_dist_frac)
+# Place atoms away from walls: y in [2r, box_side-2r], x in [2r, box_side-2r]
+function place_away_from_walls(n, box_side, r, min_dist)
+    coords = SVector{2,Float64}[]
+    max_attempts = 100000
+    attempts = 0
+    while length(coords) < n && attempts < max_attempts
+        attempts += 1
+        x = 2r + rand()*(box_side - 4r)
+        y = 2r + rand()*(box_side - 4r)
+        p = SVector{2,Float64}(x, y)
+        if all(norm(p - q) > min_dist for q in coords)
+            push!(coords, p)
+        end
+    end
+    if length(coords) < n
+        error("Could not place atoms without overlap after $max_attempts attempts")
+    end
+    return coords
+end
+init_coord = place_away_from_walls(n_droplets, box_side, droplet_radius, 2.0*droplet_radius*minimal_dist_frac)
 n_bulk   = n_droplets
 v0_bulk = [random_velocity(droplet_mass, temperature; dims=2) for _ in 1:n_droplets]
 
-if droplet_radius*2 > skipping_neighbors_threshold
-    pairwise_inter = (Molly.SoftSphere(use_neighbors=false),)
-else
-    pairwise_inter = (Molly.SoftSphere(cutoff=Molly.DistanceCutoff(cutoff), use_neighbors=true),)
-    
-end
+pairwise_inter = (Molly.SoftSphere(use_neighbors=false),)
 #endregion
 
 #region -------- Initialize wall interactions --------
 if enable_walls
     wall_up = SoftsphereWall(
-        box_side,      # Wall at y=box_side/2
+        box_side,      # Wall at y=box_side
         wall_radius,          
         wall_energy_strength, 
-        wall_radius * 3     # Cutoff
+        max(wall_radius * 3, cutoff)     # Cutoff
     )
     wall_down = SoftsphereWall(
         0.0,      # Wall at y=0
         wall_radius,          
         wall_energy_strength, 
-        wall_radius * 3     # Cutoff
+        max(wall_radius * 3, cutoff)     # Cutoff
     )
     
     walls = (wall_up, wall_down,)
@@ -254,6 +269,20 @@ post_wall! = enable_walls ? nothing :
     end
     end)
 
+# Simple hard confinement in y to keep particles inside [0, box_side]
+function confine_y!(sys::Molly.System, y_min::Float64, y_max::Float64)
+    @inbounds for i in eachindex(sys.coords)
+        p = sys.coords[i]; v = sys.velocities[i]
+        if p[2] < y_min
+            sys.coords[i] = SVector(p[1], y_min + (y_min - p[2]))
+            sys.velocities[i] = SVector(v[1], -v[2])
+        elseif p[2] > y_max
+            sys.coords[i] = SVector(p[1], y_max - (p[2] - y_max))
+            sys.velocities[i] = SVector(v[1], -v[2])
+        end
+    end
+end
+
 # Periodic-y hook (used when walls are disabled).
 post_periodic! = periodic_y_mode ? (step_idx -> begin
     apply_periodic_y!(sys, n_bulk, box_side)
@@ -272,6 +301,8 @@ end) : nothing
 
 #pre_hook  = periodic_y_mode ? nothing       : pre_wall!
 post_hook = periodic_y_mode ? post_periodic! : post_wall!
+# Always confine after each step to keep beads in the box.
+post_confine! = (step_idx -> confine_y!(sys, wall_radius, box_side - wall_radius))
 #endregion
 #region -------- Run the simulation and collect coordinates -------- 
 simulator = enable_langevin ?
@@ -281,10 +312,7 @@ simulator = enable_langevin ?
 # Compute save_every from desired_fps; if not enough steps to reach target fps, save every frame
 # frames_target = desired_fps * T; save_every ~ nsteps / frames_target
 frames_target = max(1, Int(round(desired_fps * T)))
-save_every = 10000 # max(1, Int(floor(nsteps / frames_target)))
-if save_every <= 0
-    save_every = 1
-end
+save_every = max(1, Int(floor(nsteps / frames_target)))
 
 sim_time = @elapsed begin
     coords_history = run_and_collect!(
@@ -292,7 +320,10 @@ sim_time = @elapsed begin
         simulator,
         nsteps;
         save_every=save_every,
-        post_step! = post_hook,
+        post_step! = (s -> begin
+            post_hook === nothing || post_hook(s)
+            post_confine!(s)
+        end),
     )
 end
 println("Simulation completed in $sim_time seconds.")
