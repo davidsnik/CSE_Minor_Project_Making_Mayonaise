@@ -303,6 +303,20 @@ end) : nothing
 post_hook = periodic_y_mode ? post_periodic! : post_wall!
 # Always confine after each step to keep beads in the box.
 post_confine! = (step_idx -> confine_y!(sys, wall_radius, box_side - wall_radius))
+
+# Logging hook for energy/temperature
+post_log! = (step_idx -> begin
+    if enable_energy_logging && (step_idx % save_every == 0 || step_idx == nsteps)
+        Etot = total_energy(sys)
+        push!(energy_history, Etot)
+        push!(time_history, step_idx * dt)
+    end
+    if step_idx % save_every == 0 || step_idx == nsteps
+        temp_inst = current_temperature(sys, n_bulk)
+        push!(temperature_history, temp_inst)
+        push!(temperature_time, step_idx * dt)
+    end
+end)
 #endregion
 #region -------- Run the simulation and collect coordinates -------- 
 simulator = enable_langevin ?
@@ -323,6 +337,7 @@ sim_time = @elapsed begin
         post_step! = (s -> begin
             post_hook === nothing || post_hook(s)
             post_confine!(s)
+            post_log!(s)
         end),
     )
 end
