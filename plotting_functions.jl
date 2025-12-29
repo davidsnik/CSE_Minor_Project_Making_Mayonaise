@@ -271,6 +271,7 @@ function visualize_soft_spheres_with__artificial_wall(
     box_side::Float64,
     droplet_radius::Float64,
     n_droplets::Int,
+    show_walls::Bool=true,
 )
     frames = length(coords_history)
 
@@ -303,9 +304,11 @@ function visualize_soft_spheres_with__artificial_wall(
     )
 
 
-    # Draw two thin gray horizontal lines at y = box_side/2 and y = -box_side/2 spanning all x positions
-    GLMakie.lines!(ax, [xmin, xmax], [box_side, box_side]; color=:gray, linewidth=10)
-    GLMakie.lines!(ax, [xmin, xmax], [0, 0]; color=:gray, linewidth=10)
+    if show_walls
+        # Visual cue for walls at y=0 and y=box_side
+        GLMakie.lines!(ax, [xmin, xmax], [box_side, box_side]; color=:gray, linewidth=10)
+        GLMakie.lines!(ax, [xmin, xmax], [0, 0]; color=:gray, linewidth=10)
+    end
 
     # Scatter setup (as before)
     first_frame = coords_history[1]

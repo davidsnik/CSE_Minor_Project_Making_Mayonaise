@@ -233,6 +233,28 @@ function build_soft_emulsion_system_with_artificial_walls(coords_all::Vector{SVe
                                cutoff::Float64,
                                velocities::Vector{SVector{2,Float64}},
                                pairwise_inter,
+                               nsteps::Integer; 
+                               n_threashold::Float64=0.3)
+    # Convenience wrapper when no wall interactions are present
+    return build_soft_emulsion_system_with_artificial_walls(
+        coords_all,
+        atoms,
+        box_side,
+        cutoff,
+        velocities,
+        pairwise_inter,
+        (),
+        nsteps;
+        n_threashold=n_threashold,
+    )
+end
+
+function build_soft_emulsion_system_with_artificial_walls(coords_all::Vector{SVector{2,Float64}},
+                               atoms::Vector{Atom{Int64, Float64, Float64, Float64, Float64}},
+                               box_side::Float64, 
+                               cutoff::Float64,
+                               velocities::Vector{SVector{2,Float64}},
+                               pairwise_inter,
                                wall_interactions,
                                nsteps::Integer; 
                                n_threashold::Float64=0.3)

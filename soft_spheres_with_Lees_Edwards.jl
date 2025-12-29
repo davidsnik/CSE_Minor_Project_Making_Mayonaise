@@ -200,7 +200,7 @@ dt = 1e-5
 T = 10.0                                   # CHANGE TIME HERE
 nsteps = Int(round(T/dt))
 # Desired output fps; we will subsample to approximate this while keeping duration = T (unless realistic_time=false)
-desired_fps = 1
+desired_fps = 30                          # more frames for smoother video output
 realistic_time = false                      # if true, the video plays in real time and desired fps is disregarded; if false, output fps matches desired fps 
 output_folder = "soft_spheres_LeesEdwards_mp4" # folder to save visualization output (mp4, temp plot, energy plot)
 
@@ -361,7 +361,6 @@ if enable_freq_sweep
         )
         sigma_hist_local = Float64[]
         time_hist_local = Float64[]
-        gamma_accum_local = Ref(0.0)
         total_steps = 0
         cycles_done = 0.0
         stable = false
@@ -379,11 +378,10 @@ if enable_freq_sweep
                 simulate!(sys_freq, simulator, 1)
                 t_now = (total_steps + s) * dt
                 if enable_shear
-                    t = s * dt
-                    apply_lees_edwards!(sys, box_side, t, shear_profile)
+                    apply_lees_edwards!(sys_freq, box_side, t_now, local_profile)
                 end
                 if s % save_every_freq == 0 || s == nsteps_seg
-                    γ, _ = shear_state(shear_profile, t_now)
+                    γ, _ = shear_state(local_profile, t_now)
                     push!(sigma_hist_local, shear_stress_soft(sys_freq, box_side, γ))
                     push!(time_hist_local, t_now)
                 end
