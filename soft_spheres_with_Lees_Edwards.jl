@@ -52,6 +52,13 @@ function lees_edwards_separation(xi, xj, box_side, γ)
     return SVector(dx, dy)
 end
 
+function shear_coords!(sys::Molly.System, Δγ::Float64)
+    @inbounds for i in eachindex(sys.coords)
+        c = sys.coords[i]
+        sys.coords[i] = SVector(c[1] - Δγ * c[2], c[2])
+    end
+    return nothing
+end
 # Instantaneous shear stress σ_xy = (kinetic + virial) / area for soft spheres.
 function shear_stress_soft(sys::Molly.System, box_side::Float64, γ::Float64=0.0)
     A = box_side^2
@@ -154,6 +161,7 @@ function apply_lees_edwards!(sys::Molly.System, box_side::Float64, t::Float64, s
         end
     end
 end
+
 #endregion
 # Setting random seed for reproducibility
 Random.seed!(1234)
@@ -185,8 +193,8 @@ gamma_fn = t -> gamma_amplitude * sin(2*pi*shear_freq*t)
 shear_profile = make_shear_profile(gamma_fn = gamma_fn)
 
 # Optional sweep over multiple shear frequencies (leave empty to disable).
-enable_freq_sweep = false                  # set true to run frequency sweep instead of single-run simulation
-sweep_freqs = [0.5]                        # cycles per unit time
+enable_freq_sweep = true                 # set true to run frequency sweep instead of single-run simulation
+sweep_freqs = range(0.5, stop = 10, step=0.5)                       # cycles per unit time
 cycles_per_freq = 3                        # simulate this many cycles for each swept frequency
 discard_cycles = 1                         # ignore this many initial cycles when fitting G′/G″
 max_cycles_per_freq = 5                    # safety cap on cycles per frequency
@@ -194,9 +202,9 @@ stability_percent = 10.0                   # declare G′/G″ stable if change 
 
 # ------------ Simulation settings ----------
 enable_energy_logging = true               # set false to skip energy calc/logging for speed
-enable_langevin = false                    # thermostat toggle (for the Lees-Edwards shear, NVE may be preferred)
+enable_langevin = true                 # thermostat toggle (for the Lees-Edwards shear, NVE may be preferred)
 gamma_langevin = 0.5                       # friction coefficient for Langevin thermostat
-dt = 1e-5
+dt = 1e-4
 T = 10.0                                   # CHANGE TIME HERE
 nsteps = Int(round(T/dt))
 # Desired output fps; we will subsample to approximate this while keeping duration = T (unless realistic_time=false)
@@ -221,7 +229,7 @@ println("Total oil area: ", n_droplets * droplet_area)
 println("Real volume fraction of oil: ", (n_droplets * droplet_area) / box_side^2)
 
 
-droplets = [Molly.Atom(mass=droplet_mass, σ=2*droplet_radius, ϵ=energy_strength, atom_type=1) for _ in 1:n_droplets]
+droplets = [Molly.Atom(mass=droplet_mass, σ=2*droplet_radius, ϵ=energy_strength) for _ in 1:n_droplets]
 # Boundary for placement; Molly's RectangularBoundary here is periodic flag-less. Non-periodic y is handled by walls.
 boundary = Molly.RectangularBoundary(SVector{2,Float64}(box_side, box_side))
 
@@ -339,6 +347,9 @@ simulator = enable_langevin ?
 # frames_target = desired_fps * T; save_every ~ nsteps / frames_target
 frames_target = max(1, Int(round(desired_fps * T)))
 save_every = max(1, Int(floor(nsteps / frames_target)))
+coords_cache = similar(sys.coords)
+
+
 
 if enable_freq_sweep
     Gp_sweep = Float64[]
@@ -359,6 +370,7 @@ if enable_freq_sweep
             nsteps;
             n_threashold = skipping_neighbors_threshold,
         )
+        gamma_accum_freq = Ref(0.0)
         sigma_hist_local = Float64[]
         time_hist_local = Float64[]
         total_steps = 0
@@ -375,6 +387,17 @@ if enable_freq_sweep
             nsteps_seg = max(1, Int(round(seg_time / dt)))
             save_every_freq = max(1, Int(floor(nsteps_seg / max(1, Int(round(desired_fps * seg_time))))))
             for s in 1:nsteps_seg
+                # pre-step shear (incremental) at time just before this step
+                if enable_shear
+                    t_pre = (total_steps + s - 1) * dt
+                    γ, _ = shear_state(local_profile, t_pre)
+                    Δγ = γ - gamma_accum_freq[]
+                    if Δγ != 0.0
+                        shear_coords!(sys_freq, Δγ)
+                        gamma_accum_freq[] = γ
+                    end
+                end
+
                 simulate!(sys_freq, simulator, 1)
                 t_now = (total_steps + s) * dt
                 if enable_shear
@@ -449,10 +472,22 @@ else
             simulator,
             nsteps;
             save_every=save_every,
+            pre_step! = (s -> begin
+                if enable_shear
+                    t = s * dt
+                    γ, _ = shear_state(shear_profile, t)
+                    Δγ = γ - gamma_accum[]
+                    if Δγ != 0.0
+                        shear_coords!(sys, Δγ)
+                        gamma_accum[] = γ
+                    end
+                end
+            end),
             post_step! = (s -> begin
                 t = s * dt
                 if enable_shear
                     apply_lees_edwards!(sys, box_side, t, shear_profile)
+                    
                 end
                 post_log!(s)
             end),
@@ -474,7 +509,7 @@ else
     visualize_soft_spheres_with__artificial_wall(
         coords_history,
         boundary,
-        joinpath(outdir, "sim_soft_spheres_aw_vf$(round(volume_fraction_oil, digits=2))_d$(round(droplet_radius, digits=2)).mp4");
+        joinpath(outdir, "sim_soft_spheres_aw_vf$(round(volume_fraction_oil, digits=2))_d$(round(droplet_radius, digits=2))_shearamp$(round(gamma_amplitude, digits=3)).mp4");
         box_side=box_side,
         framerate=fps,
         droplet_radius=droplet_radius,
@@ -517,7 +552,8 @@ else
         figG = GLMakie.Figure(size=(600,400))
         axG = GLMakie.Axis(figG[1,1]; xlabel="time", ylabel="shear modulus")
         GLMakie.lines!(axG, G_time, G_hist, color=:purple)
-        G_outfile = joinpath(outdir, "shear_modulus_vs_time.png")
+        
+        G_outfile = joinpath(outdir, "shear_modulus_vs_time_sA$(round(gamma_amplitude, digits=3))_sf$(round(shear_freq, digits=3)).png")
         GLMakie.save(G_outfile, figG)
         println("Saved shear modulus plot to ", G_outfile)
     end
@@ -527,7 +563,7 @@ else
         figE = GLMakie.Figure(size=(600,400))
         axE = GLMakie.Axis(figE[1,1]; xlabel="time", ylabel="total energy")
         GLMakie.lines!(axE, time_history, energy_history, color=:black)
-        energy_outfile = joinpath(outdir, "energy_vs_time.png")
+        energy_outfile = joinpath(outdir, "energy_vs_time_sA$(round(gamma_amplitude, digits=3))_sf$(round(shear_freq, digits=3)).png")
         GLMakie.save(energy_outfile, figE)
         println("Saved energy plot to ", energy_outfile)
     end
@@ -561,9 +597,10 @@ else
                 GLMakie.lines!(axGL, Gmod_time, Gprime_hist, color=:blue, label="G'")
                 GLMakie.lines!(axGL, Gmod_time, Gloss_hist,  color=:red, label="G''")
                 GLMakie.axislegend(axGL)
-                mod_outfile = joinpath(outdir, "storage_loss_moduli_vs_time.png")
+                mod_outfile = joinpath(outdir, "storage_loss_moduli_vs_time_sA$(round(gamma_amplitude, digits=3))_sf$(round(shear_freq, digits=3)).png")
                 GLMakie.save(mod_outfile, figGL)
                 println("Saved storage/loss moduli plot to ", mod_outfile)
+                println("Final G' = $(Gprime_hist[end]), G'' = $(Gloss_hist[end]) at frequency $(shear_freq) and amplitude $(gamma_amplitude).")
             end
         end
     end
@@ -573,7 +610,7 @@ else
         figT = GLMakie.Figure(size=(600,400))
         axT = GLMakie.Axis(figT[1,1]; xlabel="time", ylabel="kinetic temperature")
         GLMakie.lines!(axT, temperature_time, temperature_history, color=:red)
-        temp_outfile = joinpath(outdir, "temperature_vs_time.png")
+        temp_outfile = joinpath(outdir, "temperature_vs_time_sA$(round(gamma_amplitude, digits=3))_sf$(round(shear_freq, digits=3)).png")
         GLMakie.save(temp_outfile, figT)
         println("Saved temperature plot to ", temp_outfile)
     end
