@@ -194,15 +194,17 @@ shear_profile = make_shear_profile(gamma_fn = gamma_fn)
 
 # Optional sweep over multiple shear frequencies (leave empty to disable).
 enable_freq_sweep = true                 # set true to run frequency sweep instead of single-run simulation
-sweep_freqs = range(0.5, stop = 10, step=0.5)                       # cycles per unit time
+sweep_freqs = range(0.5, stop = 12, step=0.5)                       # cycles per unit time
 cycles_per_freq = 3                        # simulate this many cycles for each swept frequency
 discard_cycles = 1                         # ignore this many initial cycles when fitting G′/G″
 max_cycles_per_freq = 5                    # safety cap on cycles per frequency
 stability_percent = 10.0                   # declare G′/G″ stable if change is below this percent
+min_time_per_freq = 5.0                    # minimum simulated time (same units as T) per frequency to reach steady response
+parallel_freq_sweep = true                 # set true to run each frequency on a separate thread (requires JULIA_NUM_THREADS>1)
 
 # ------------ Simulation settings ----------
 enable_energy_logging = true               # set false to skip energy calc/logging for speed
-enable_langevin = true                 # thermostat toggle (for the Lees-Edwards shear, NVE may be preferred)
+enable_langevin = true                     # thermostat toggle (for the Lees-Edwards shear, NVE may be preferred)
 gamma_langevin = 0.5                       # friction coefficient for Langevin thermostat
 dt = 1e-4
 T = 10.0                                   # CHANGE TIME HERE
@@ -352,17 +354,133 @@ coords_cache = similar(sys.coords)
 
 
 if enable_freq_sweep
-    Gp_sweep = Float64[]
-    Gpp_sweep = Float64[]
-    freq_used = Float64[]
-    p_freqs = HAS_PROGRESSMETER[] ? ProgressMeter.Progress(length(sweep_freqs); desc="Freq sweep", dt=0.2) : nothing
+    if parallel_freq_sweep
+        using Base.Threads
+        results_lock = Threads.ReentrantLock()
+        results = Vector{NTuple{3,Float64}}()  # (freq, Gp, Gpp)
+        Threads.@threads for idx in eachindex(sweep_freqs)
+            f = sweep_freqs[idx]
+            # ... identical body but without inner progress bars ...
+            local_gamma_fn = t -> gamma_amplitude * sin(2*pi*f*t)
+            local_profile = make_shear_profile(gamma_fn = local_gamma_fn)
+            sys_freq = build_soft_emulsion_system_with_artificial_walls(
+                copy(init_coord),
+                droplets,
+                box_side,
+                cutoff,
+                copy(v0_bulk),
+                pairwise_inter,
+                nsteps;
+                n_threashold = skipping_neighbors_threshold,
+            )
+            gamma_accum_freq = Ref(0.0)
+            sigma_hist_local = Float64[]
+            time_hist_local = Float64[]
+            total_steps = 0
+            cycles_done = 0.0
+            stable = false
+            last_Gp = nothing
+            last_Gpp = nothing
+            total_cycles_target = min(max_cycles_per_freq, discard_cycles + cycles_per_freq)
+            min_steps_freq = max(1, Int(ceil(min_time_per_freq / dt)))
+            time_target = max(total_cycles_target/f, min_time_per_freq)
 
-    for f in sweep_freqs
-        local_gamma_fn = t -> gamma_amplitude * sin(2*pi*f*t)
-        local_profile = make_shear_profile(gamma_fn = local_gamma_fn)
-        sys_freq = build_soft_emulsion_system_with_artificial_walls(
-            copy(init_coord),
-            droplets,
+            segment_cycles = 1  # check stability every cycle for early stop
+            while (total_steps < min_steps_freq) || (!stable && cycles_done < max_cycles_per_freq)
+                seg_time = segment_cycles / f
+                nsteps_seg = max(1, Int(round(seg_time / dt)))
+                save_every_freq = max(1, Int(floor(nsteps_seg / max(1, Int(round(desired_fps * seg_time))))))
+                for s in 1:nsteps_seg
+                    # pre-step shear (incremental) at time just before this step
+                    if enable_shear
+                        t_pre = (total_steps + s - 1) * dt
+                        γ, _ = shear_state(local_profile, t_pre)
+                        Δγ = γ - gamma_accum_freq[]
+                        if Δγ != 0.0
+                            shear_coords!(sys_freq, Δγ)
+                            gamma_accum_freq[] = γ
+                        end
+                    end
+
+                    simulate!(sys_freq, simulator, 1)
+                    t_now = (total_steps + s) * dt
+                    if enable_shear
+                        apply_lees_edwards!(sys_freq, box_side, t_now, local_profile)
+                    end
+                    if s % save_every_freq == 0 || s == nsteps_seg
+                        γ, _ = shear_state(local_profile, t_now)
+                        push!(sigma_hist_local, shear_stress_soft(sys_freq, box_side, γ))
+                        push!(time_hist_local, t_now)
+                    end
+                end
+                total_steps += nsteps_seg
+                cycles_done = total_steps * dt * f
+
+                # check stability after accumulating some cycles
+                if cycles_done >= max(discard_cycles + 1, 1)
+                    ω = 2*pi*f
+                    t_min = discard_cycles / f
+                    s_sin = 0.0; s_cos = 0.0; s_sin2 = 0.0; s_cos2 = 0.0
+                    for (σ, t) in zip(sigma_hist_local, time_hist_local)
+                        t < t_min && continue
+                        s_val = sin(ω * t); c_val = cos(ω * t)
+                        s_sin += σ * s_val
+                        s_cos += σ * c_val
+                        s_sin2 += s_val * s_val
+                        s_cos2 += c_val * c_val
+                    end
+                    if gamma_amplitude > eps(Float64) && (s_sin2 > eps(Float64) || s_cos2 > eps(Float64))
+                        Gp = s_sin / (gamma_amplitude * max(s_sin2, eps(Float64)))
+                        Gpp = s_cos / (gamma_amplitude * max(s_cos2, eps(Float64)))
+                        if last_Gp !== nothing && last_Gpp !== nothing
+                            rel_gp  = abs(last_Gp  - Gp)  / max(abs(Gp),  1e-9)
+                            rel_gpp = abs(last_Gpp - Gpp) / max(abs(Gpp), 1e-9)
+                            tol = stability_percent / 100
+                            if rel_gp < tol && rel_gpp < tol
+                                stable = true
+                            end
+                        end
+                        last_Gp = Gp
+                        last_Gpp = Gpp
+                    end
+                end
+            end
+
+            if last_Gp !== nothing && last_Gpp !== nothing
+                Threads.lock(results_lock) do
+                    push!(results, (f, last_Gp, last_Gpp))
+                end
+            end
+        end
+
+        if !isempty(results)
+            sort!(results, by = x -> x[1])
+            freq_used = [r[1] for r in results]
+            Gp_sweep  = [r[2] for r in results]
+            Gpp_sweep = [r[3] for r in results]
+            figSweep = GLMakie.Figure(size=(700,400))
+            axSweep = GLMakie.Axis(figSweep[1,1]; xlabel="shear frequency", ylabel="modulus")
+            GLMakie.lines!(axSweep, freq_used, Gp_sweep, color=:blue, label="G'")
+            GLMakie.lines!(axSweep, freq_used, Gpp_sweep, color=:red, label="G''")
+            GLMakie.axislegend(axSweep)
+            sweep_outfile = joinpath(outdir, "storage_loss_moduli_freq_sweep.png")
+            GLMakie.save(sweep_outfile, figSweep)
+            println("Saved swept-frequency moduli to ", sweep_outfile)
+        else
+            println("No valid frequency points for sweep (check gamma_amplitude or data).")
+        end
+    else
+        Gp_sweep = Float64[]
+        Gpp_sweep = Float64[]
+        freq_used = Float64[]
+        p_freqs = HAS_PROGRESSMETER[] ? ProgressMeter.Progress(length(sweep_freqs); desc="Freq sweep", dt=0.2) : nothing
+
+        for f in sweep_freqs
+            local_gamma_fn = t -> gamma_amplitude * sin(2*pi*f*t)
+            local_profile = make_shear_profile(gamma_fn = local_gamma_fn)
+            sys_freq = build_soft_emulsion_system_with_artificial_walls(
+                copy(init_coord),
+                droplets,
             box_side,
             cutoff,
             copy(v0_bulk),
@@ -379,10 +497,12 @@ if enable_freq_sweep
         last_Gp = nothing
         last_Gpp = nothing
         total_cycles_target = min(max_cycles_per_freq, discard_cycles + cycles_per_freq)
-        p_run = HAS_PROGRESSMETER[] ? ProgressMeter.Progress(max(1, Int(round((total_cycles_target/f)/dt))); desc="freq=$(round(f,digits=3))", dt=0.1) : nothing
+            min_steps_freq = max(1, Int(ceil(min_time_per_freq / dt)))
+            time_target = max(total_cycles_target/f, min_time_per_freq)
+            p_run = HAS_PROGRESSMETER[] ? ProgressMeter.Progress(max(1, Int(round(time_target/dt))); desc="freq=$(round(f,digits=3))", dt=0.1) : nothing
 
         segment_cycles = 1  # check stability every cycle for early stop
-        while !stable && cycles_done < max_cycles_per_freq
+        while (total_steps < min_steps_freq) || (!stable && cycles_done < max_cycles_per_freq)
             seg_time = segment_cycles / f
             nsteps_seg = max(1, Int(round(seg_time / dt)))
             save_every_freq = max(1, Int(floor(nsteps_seg / max(1, Int(round(desired_fps * seg_time))))))
@@ -443,26 +563,28 @@ if enable_freq_sweep
             end
         end
 
-        if last_Gp !== nothing && last_Gpp !== nothing
-            push!(Gp_sweep, last_Gp)
-            push!(Gpp_sweep, last_Gpp)
-            push!(freq_used, f)
+            if last_Gp !== nothing && last_Gpp !== nothing
+                push!(Gp_sweep, last_Gp)
+                push!(Gpp_sweep, last_Gpp)
+                push!(freq_used, f)
+            end
+            p_run === nothing || ProgressMeter.next!(p_run)
         end
-        p_freqs === nothing || ProgressMeter.next!(p_freqs)
-    end
 
-    if !isempty(freq_used)
-        figSweep = GLMakie.Figure(size=(700,400))
-        axSweep = GLMakie.Axis(figSweep[1,1]; xlabel="shear frequency", ylabel="modulus")
-        GLMakie.lines!(axSweep, freq_used, Gp_sweep, color=:blue, label="G'")
-        GLMakie.lines!(axSweep, freq_used, Gpp_sweep, color=:red, label="G''")
-        GLMakie.axislegend(axSweep)
+        if !isempty(freq_used)
+            figSweep = GLMakie.Figure(size=(700,400))
+            axSweep = GLMakie.Axis(figSweep[1,1]; xlabel="shear frequency", ylabel="modulus")
+            GLMakie.lines!(axSweep, freq_used, Gp_sweep, color=:blue, label="G'")
+            GLMakie.lines!(axSweep, freq_used, Gpp_sweep, color=:red, label="G''")
+            GLMakie.axislegend(axSweep)
         sweep_outfile = joinpath(outdir, "storage_loss_moduli_freq_sweep.png")
         GLMakie.save(sweep_outfile, figSweep)
         println("Saved swept-frequency moduli to ", sweep_outfile)
     else
         println("No valid frequency points for sweep (check gamma_amplitude or data).")
     end
+
+end
 
 else
     sim_time = @elapsed begin
