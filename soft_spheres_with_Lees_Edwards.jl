@@ -37,6 +37,10 @@ include(joinpath(@__DIR__, "system_and_simulation_functions.jl"))
 include(joinpath(@__DIR__, "plotting_functions.jl"))
 # visualize_with_progress, plot_hull_points
 
+# Custom neighbor finder for Lees–Edwards boundaries
+include(joinpath(@__DIR__, "lees_edwards_neighbors.jl"))
+using .LeesEdwardsNeighbors
+
 #endregion
 #region ------- Special functions for this program -----
 function lees_edwards_separation(xi, xj, box_side, γ)
@@ -162,6 +166,50 @@ function apply_lees_edwards!(sys::Molly.System, box_side::Float64, t::Float64, s
     end
 end
 
+# Peculiar-velocity Langevin thermostat for Lees–Edwards shear: damps v - u(y,t)
+function apply_peculiar_langevin!(
+    sys::Molly.System,
+    shear_profile,
+    t::Float64;
+    temperature::Float64,
+    friction::Float64,
+    dt::Float64,
+)
+    kT = temperature  # k_B=1 convention
+    _, γ̇ = shear_state(shear_profile, t)
+    @inbounds for i in eachindex(sys.velocities)
+        v = sys.velocities[i]
+        y = sys.coords[i][2]
+        u = SVector(γ̇ * y, 0.0)               # streaming velocity (simple shear)
+        vpec = v - u                          # peculiar velocity
+        m = sys.atoms[i].mass
+        α = max(0.0, 1.0 - friction * dt)     # small-dt damping factor
+        σ = sqrt(2.0 * friction * kT * dt / m) # noise amplitude (Euler–Maruyama)
+        vpec_new = SVector(
+            α * vpec[1] + σ * randn(),
+            α * vpec[2] + σ * randn(),
+        )
+        sys.velocities[i] = vpec_new + u
+    end
+    return nothing
+end
+
+function frinction_changer(f::Float64, gamma_langevin::Float64)
+     if f > 3
+        if f > 7
+            if f > 11
+                friction_local = 4.0
+            else
+                friction_local = 3.0
+            end
+        else
+            friction_local = 2.0
+        end
+    else
+        friction_local = gamma_langevin
+    end
+    return friction_local
+end
 #endregion
 # Setting random seed for reproducibility
 Random.seed!(1234)
@@ -187,13 +235,13 @@ enable_walls = false                       # set false to disable walls and use 
 # Time-dependent shear strain gamma(t). Sinusoidal for viscoelastic analysis.
 enable_shear = true                        # apply affine shear each step based on gamma_fn
 gamma_amplitude = 0.05
-shear_freq = 0.5                           # cycles per unit time
+shear_freq = 5.0                          # cycles per unit time
 
 gamma_fn = t -> gamma_amplitude * sin(2*pi*shear_freq*t)
 shear_profile = make_shear_profile(gamma_fn = gamma_fn)
 
 # Optional sweep over multiple shear frequencies (leave empty to disable).
-enable_freq_sweep = true                 # set true to run frequency sweep instead of single-run simulation
+enable_freq_sweep = false             # set true to run frequency sweep instead of single-run simulation
 sweep_freqs = range(0.5, stop = 12, step=0.5)                       # cycles per unit time
 cycles_per_freq = 3                        # simulate this many cycles for each swept frequency
 discard_cycles = 1                         # ignore this many initial cycles when fitting G′/G″
@@ -215,6 +263,7 @@ realistic_time = false                      # if true, the video plays in real t
 output_folder = "soft_spheres_LeesEdwards_mp4" # folder to save visualization output (mp4, temp plot, energy plot)
 
 compute_modulus_history = true # compute shear modulus for saved frames after the run
+enable_peculiar_langevin = true # if true, apply thermostat to peculiar velocities v - γ̇(t) y ex
 #endregion
 
 
@@ -239,7 +288,7 @@ init_coord = Molly.place_atoms(n_droplets, boundary; min_dist=minimal_dist_frac 
 n_bulk   = n_droplets
 v0_bulk = [random_velocity(droplet_mass, temperature; dims=2) for _ in 1:n_droplets]
 
-pairwise_inter = (Molly.SoftSphere(use_neighbors=false),)
+pairwise_inter = (Molly.SoftSphere(use_neighbors=true),)
 #endregion
 #region ------- Plot the force function -----
 rs = range(0.1*droplet_radius, 4*droplet_radius, length=500) # Distance range 
@@ -289,7 +338,7 @@ save(joinpath(outdir, "soft_sphere_force_plot.png"), fig)
 println("Force plot saved as 'soft_sphere_force_plot.png'.")
 #endregion
 #region ------- Build the system and run simulation -----
-
+nf_main = LeesEdwardsNeighbors.make_le_neighbor_finder(; cutoff=cutoff, n_steps=10, box_side=box_side, shear_profile=shear_profile, dt=dt)
 sys = build_soft_emulsion_system_with_artificial_walls(
     init_coord,
     droplets,
@@ -299,6 +348,7 @@ sys = build_soft_emulsion_system_with_artificial_walls(
     pairwise_inter,
     nsteps;
     n_threashold = skipping_neighbors_threshold,
+    neighbourfinder=nf_main,
 )
 #endregion
 #region -------- Energy and temperature logging setup --------
@@ -354,15 +404,25 @@ coords_cache = similar(sys.coords)
 
 
 if enable_freq_sweep
+    # Prepare separate output folder for per-frequency time-resolved moduli plots
+    time_moduli_dir = joinpath(outdir, "freq_sweep_moduli_time")
+    isdir(time_moduli_dir) || mkpath(time_moduli_dir)
     if parallel_freq_sweep
         using Base.Threads
         results_lock = Threads.ReentrantLock()
+        plots_data_lock = Threads.ReentrantLock()
         results = Vector{NTuple{3,Float64}}()  # (freq, Gp, Gpp)
+        plots_data = Vector{NamedTuple{(:f, :time, :Gp_t, :Gpp_t), Tuple{Float64, Vector{Float64}, Vector{Float64}, Vector{Float64}}}}()
         Threads.@threads for idx in eachindex(sweep_freqs)
             f = sweep_freqs[idx]
+            friction_local =  frinction_changer(f, gamma_langevin)
+            simulator = enable_langevin ?
+                Langevin(dt = dt, temperature = temperature, friction = friction_local) :
+                VelocityVerlet(dt = dt)
             # ... identical body but without inner progress bars ...
             local_gamma_fn = t -> gamma_amplitude * sin(2*pi*f*t)
             local_profile = make_shear_profile(gamma_fn = local_gamma_fn)
+            nf_main = LeesEdwardsNeighbors.make_le_neighbor_finder(; cutoff=cutoff, n_steps=10, box_side=box_side, shear_profile=local_profile, dt=dt)
             sys_freq = build_soft_emulsion_system_with_artificial_walls(
                 copy(init_coord),
                 droplets,
@@ -372,6 +432,7 @@ if enable_freq_sweep
                 pairwise_inter,
                 nsteps;
                 n_threashold = skipping_neighbors_threshold,
+                neighbourfinder=nf_main,
             )
             gamma_accum_freq = Ref(0.0)
             sigma_hist_local = Float64[]
@@ -406,6 +467,16 @@ if enable_freq_sweep
                     t_now = (total_steps + s) * dt
                     if enable_shear
                         apply_lees_edwards!(sys_freq, box_side, t_now, local_profile)
+                        if enable_peculiar_langevin && friction_local > 0
+                            apply_peculiar_langevin!(
+                                sys_freq,
+                                local_profile,
+                                t_now;
+                                temperature=temperature,
+                                friction=friction_local,
+                                dt=dt,
+                            )
+                        end
                     end
                     if s % save_every_freq == 0 || s == nsteps_seg
                         γ, _ = shear_state(local_profile, t_now)
@@ -446,10 +517,44 @@ if enable_freq_sweep
                 end
             end
 
+            # Collect per-frequency time-resolved G'(t)/G''(t) data (plot later on main thread)
+            if !isempty(time_hist_local)
+                ω = 2*pi*f
+                s_sin = 0.0; s_cos = 0.0; s_sin2 = 0.0; s_cos2 = 0.0
+                Gprime_hist_local = Float64[]
+                Gloss_hist_local = Float64[]
+                for (σ, t) in zip(sigma_hist_local, time_hist_local)
+                    s_val = sin(ω * t)
+                    c_val = cos(ω * t)
+                    s_sin += σ * s_val
+                    s_cos += σ * c_val
+                    s_sin2 += s_val * s_val
+                    s_cos2 += c_val * c_val
+                    push!(Gprime_hist_local, s_sin / (gamma_amplitude * max(s_sin2, eps(Float64))))
+                    push!(Gloss_hist_local,  s_cos / (gamma_amplitude * max(s_cos2, eps(Float64))))
+                end
+                Threads.lock(plots_data_lock) do
+                    push!(plots_data, (f=f, time=time_hist_local, Gp_t=Gprime_hist_local, Gpp_t=Gloss_hist_local))
+                end
+            end
+
             if last_Gp !== nothing && last_Gpp !== nothing
                 Threads.lock(results_lock) do
                     push!(results, (f, last_Gp, last_Gpp))
                 end
+            end
+        end
+
+        # Save collected per-frequency time-moduli plots on main thread
+        if !isempty(plots_data)
+            for d in plots_data
+                figLocal = GLMakie.Figure(size=(700,400))
+                axLocal = GLMakie.Axis(figLocal[1,1]; xlabel="time", ylabel="modulus")
+                GLMakie.lines!(axLocal, d.time, d.Gp_t, color=:blue, label="G'")
+                GLMakie.lines!(axLocal, d.time, d.Gpp_t, color=:red, label="G''")
+                GLMakie.axislegend(axLocal)
+                local_outfile = joinpath(time_moduli_dir, "storage_loss_moduli_vs_time_freq$(round(d.f, digits=3)).png")
+                GLMakie.save(local_outfile, figLocal)
             end
         end
 
@@ -476,8 +581,14 @@ if enable_freq_sweep
         p_freqs = HAS_PROGRESSMETER[] ? ProgressMeter.Progress(length(sweep_freqs); desc="Freq sweep", dt=0.2) : nothing
 
         for f in sweep_freqs
+            friction_local = frinction_changer(f, gamma_langevin)
+            simulator = enable_langevin ?
+                Langevin(dt = dt, temperature = temperature, friction = friction_local) :
+                VelocityVerlet(dt = dt)
+
             local_gamma_fn = t -> gamma_amplitude * sin(2*pi*f*t)
             local_profile = make_shear_profile(gamma_fn = local_gamma_fn)
+            nf_main = LeesEdwardsNeighbors.make_le_neighbor_finder(; cutoff=cutoff, n_steps=10, box_side=box_side, shear_profile=local_profile, dt=dt)
             sys_freq = build_soft_emulsion_system_with_artificial_walls(
                 copy(init_coord),
                 droplets,
@@ -487,6 +598,7 @@ if enable_freq_sweep
             pairwise_inter,
             nsteps;
             n_threashold = skipping_neighbors_threshold,
+            neighbourfinder=nf_main,
         )
         gamma_accum_freq = Ref(0.0)
         sigma_hist_local = Float64[]
@@ -522,6 +634,17 @@ if enable_freq_sweep
                 t_now = (total_steps + s) * dt
                 if enable_shear
                     apply_lees_edwards!(sys_freq, box_side, t_now, local_profile)
+                
+                    if enable_peculiar_langevin && friction_local > 0
+                        apply_peculiar_langevin!(
+                            sys_freq,
+                            local_profile,
+                            t_now;
+                            temperature=temperature,
+                            friction=friction_local,
+                            dt=dt,
+                        )
+                    end
                 end
                 if s % save_every_freq == 0 || s == nsteps_seg
                     γ, _ = shear_state(local_profile, t_now)
@@ -563,6 +686,31 @@ if enable_freq_sweep
             end
         end
 
+            # Create per-frequency time-resolved G'(t)/G''(t) plot
+            if !isempty(time_hist_local)
+                ω = 2*pi*f
+                s_sin = 0.0; s_cos = 0.0; s_sin2 = 0.0; s_cos2 = 0.0
+                Gprime_hist_local = Float64[]
+                Gloss_hist_local = Float64[]
+                for (σ, t) in zip(sigma_hist_local, time_hist_local)
+                    s_val = sin(ω * t)
+                    c_val = cos(ω * t)
+                    s_sin += σ * s_val
+                    s_cos += σ * c_val
+                    s_sin2 += s_val * s_val
+                    s_cos2 += c_val * c_val
+                    push!(Gprime_hist_local, s_sin / (gamma_amplitude * max(s_sin2, eps(Float64))))
+                    push!(Gloss_hist_local,  s_cos / (gamma_amplitude * max(s_cos2, eps(Float64))))
+                end
+                figLocal = GLMakie.Figure(size=(700,400))
+                axLocal = GLMakie.Axis(figLocal[1,1]; xlabel="time", ylabel="modulus")
+                GLMakie.lines!(axLocal, time_hist_local, Gprime_hist_local, color=:blue, label="G'")
+                GLMakie.lines!(axLocal, time_hist_local, Gloss_hist_local,  color=:red, label="G''")
+                GLMakie.axislegend(axLocal)
+                local_outfile = joinpath(time_moduli_dir, "storage_loss_moduli_vs_time_freq$(round(f, digits=3)).png")
+                GLMakie.save(local_outfile, figLocal)
+            end
+
             if last_Gp !== nothing && last_Gpp !== nothing
                 push!(Gp_sweep, last_Gp)
                 push!(Gpp_sweep, last_Gpp)
@@ -587,6 +735,11 @@ if enable_freq_sweep
 end
 
 else
+    friction_local =  frinction_changer(shear_freq, gamma_langevin)
+   
+    simulator = enable_langevin ?
+        Langevin(dt = dt, temperature = temperature, friction = friction_local) :
+        VelocityVerlet(dt = dt)
     sim_time = @elapsed begin
         gamma_accum = Ref(0.0)
         coords_history = run_and_collect!(
@@ -628,15 +781,17 @@ else
         fps = desired_fps 
     end
     frames = length(coords_history)
+    
     visualize_soft_spheres_with__artificial_wall(
         coords_history,
         boundary,
-        joinpath(outdir, "sim_soft_spheres_aw_vf$(round(volume_fraction_oil, digits=2))_d$(round(droplet_radius, digits=2))_shearamp$(round(gamma_amplitude, digits=3)).mp4");
+        joinpath(outdir, "sim_soft_spheres_aw_vf$(round(volume_fraction_oil, digits=2))_d$(round(droplet_radius, digits=2))_shearamp$(round(gamma_amplitude, digits=3))_sf$(round(shear_freq, digits=3)).mp4");
         box_side=box_side,
         framerate=fps,
         droplet_radius=droplet_radius,
         n_droplets=n_droplets,
         show_walls=enable_walls,
+
     )
 
     # Compute and plot shear modulus over saved frames if requested
@@ -648,6 +803,7 @@ else
             energy_at_gamma = function(gamma)
                 coords_sheared = [SVector(mod(p[1] + gamma*p[2], box_side), p[2]) for p in base_coords]
                 zero_vels = [SVector{2,Float64}(0.0,0.0) for _ in coords_sheared]
+                nf = LeesEdwardsNeighbors.make_le_neighbor_finder(; cutoff=cutoff, n_steps=10, box_side=box_side, shear_profile=shear_profile, dt=dt)
                 sys_tmp = build_soft_emulsion_system_with_artificial_walls(
                     coords_sheared,
                     droplets,
@@ -655,8 +811,9 @@ else
                     cutoff,
                     zero_vels,
                     pairwise_inter,
-                    1;
+                    1,
                     n_threashold = skipping_neighbors_threshold,
+                    neighbourfinder=nf,
                 )
                 return total_energy(sys_tmp)
             end
